@@ -85,12 +85,178 @@ describe('DRAW_SECRET — blind draw', () => {
   });
 });
 
+/** A match in active play with both secrets drawn and it being `first`'s turn to ask. */
+function playingMatch(first: 'player1' | 'player2' = 'player1', overrides: Partial<MatchState> = {}): MatchState {
+  return activeMatch({
+    player1Secret: 7,
+    player2Secret: 12,
+    firstPlayer: first,
+    currentPlayer: first,
+    phase: 'awaiting_question',
+    ...overrides,
+  });
+}
+
+describe('ASK / ANSWER — the turn loop', () => {
+  test('the current player asks; the phase moves to awaiting_answer with the turn unchanged', () => {
+    const next = reduce(playingMatch('player1'), {
+      type: 'ASK',
+      player: 'player1',
+      question: 'Is it a fire type?',
+    });
+    expect(next.phase).toBe('awaiting_answer');
+    // The asker is still the current player — the *opponent* is the one who must act now.
+    expect(next.currentPlayer).toBe('player1');
+  });
+
+  test('a player cannot ask when it is not their turn', () => {
+    expect(() =>
+      reduce(playingMatch('player1'), { type: 'ASK', player: 'player2', question: 'Is it blue?' }),
+    ).toThrow(/not your turn/i);
+  });
+
+  test('a player cannot ask while an answer is still pending', () => {
+    const afterAsk = reduce(playingMatch('player1'), {
+      type: 'ASK',
+      player: 'player1',
+      question: 'Is it a fire type?',
+    });
+    expect(() =>
+      reduce(afterAsk, { type: 'ASK', player: 'player1', question: 'Is it big?' }),
+    ).toThrow(/not expected|awaiting/i);
+  });
+
+  test('an empty question is rejected', () => {
+    expect(() =>
+      reduce(playingMatch('player1'), { type: 'ASK', player: 'player1', question: '   ' }),
+    ).toThrow(/empty/i);
+  });
+
+  test('the opponent answers; the turn passes to them and the phase returns to awaiting_question', () => {
+    const afterAsk = reduce(playingMatch('player1'), {
+      type: 'ASK',
+      player: 'player1',
+      question: 'Is it a fire type?',
+    });
+    const afterAnswer = reduce(afterAsk, { type: 'ANSWER', player: 'player2', answer: 'No' });
+    expect(afterAnswer.phase).toBe('awaiting_question');
+    expect(afterAnswer.currentPlayer).toBe('player2');
+  });
+
+  test('the asking player cannot answer their own question', () => {
+    const afterAsk = reduce(playingMatch('player1'), {
+      type: 'ASK',
+      player: 'player1',
+      question: 'Is it a fire type?',
+    });
+    expect(() => reduce(afterAsk, { type: 'ANSWER', player: 'player1', answer: 'Yes' })).toThrow(
+      /own question|not your turn/i,
+    );
+  });
+
+  test('cannot answer when no question is pending', () => {
+    expect(() =>
+      reduce(playingMatch('player1'), { type: 'ANSWER', player: 'player2', answer: 'No' }),
+    ).toThrow(/no question|awaiting_question/i);
+  });
+
+  test('a full round trips the turn from player1 to player2 and back', () => {
+    let s = playingMatch('player1');
+    s = reduce(s, { type: 'ASK', player: 'player1', question: 'Fire?' });
+    s = reduce(s, { type: 'ANSWER', player: 'player2', answer: 'No' });
+    // Now it is player2's turn to ask.
+    s = reduce(s, { type: 'ASK', player: 'player2', question: 'Water?' });
+    s = reduce(s, { type: 'ANSWER', player: 'player1', answer: 'Yes' });
+    expect(s.currentPlayer).toBe('player1');
+    expect(s.phase).toBe('awaiting_question');
+  });
+});
+
+describe('CROSS_OFF — private board marks', () => {
+  test('a player can cross off a card on their own board', () => {
+    const next = reduce(playingMatch('player1'), {
+      type: 'CROSS_OFF',
+      player: 'player1',
+      pokemonId: 3,
+      eliminated: true,
+    });
+    expect(next.eliminated.player1).toContain(3);
+    expect(next.eliminated.player2).toEqual([]);
+  });
+
+  test('un-crossing removes the mark', () => {
+    const crossed = reduce(playingMatch('player1'), {
+      type: 'CROSS_OFF',
+      player: 'player1',
+      pokemonId: 3,
+      eliminated: true,
+    });
+    const uncrossed = reduce(crossed, {
+      type: 'CROSS_OFF',
+      player: 'player1',
+      pokemonId: 3,
+      eliminated: false,
+    });
+    expect(uncrossed.eliminated.player1).not.toContain(3);
+  });
+
+  test('crossing off is NOT turn-gated — a player may mark during their opponent’s turn', () => {
+    // It is player1's turn to ask; player2 crosses off anyway.
+    const next = reduce(playingMatch('player1'), {
+      type: 'CROSS_OFF',
+      player: 'player2',
+      pokemonId: 5,
+      eliminated: true,
+    });
+    expect(next.eliminated.player2).toContain(5);
+  });
+
+  test('crossing off is un-gated by phase — it works while an answer is pending', () => {
+    const afterAsk = reduce(playingMatch('player1'), {
+      type: 'ASK',
+      player: 'player1',
+      question: 'Fire?',
+    });
+    const next = reduce(afterAsk, {
+      type: 'CROSS_OFF',
+      player: 'player1',
+      pokemonId: 5,
+      eliminated: true,
+    });
+    expect(next.eliminated.player1).toContain(5);
+    // The turn loop is untouched by a private mark.
+    expect(next.phase).toBe('awaiting_answer');
+    expect(next.currentPlayer).toBe('player1');
+  });
+
+  test('a mark never mutates the opponent’s visible state', () => {
+    const start = playingMatch('player1', { eliminated: { player1: [], player2: [9] } });
+    const next = reduce(start, {
+      type: 'CROSS_OFF',
+      player: 'player1',
+      pokemonId: 3,
+      eliminated: true,
+    });
+    // Opponent's list is unchanged and not the same array reference we can mutate.
+    expect(next.eliminated.player2).toEqual([9]);
+    expect(start.eliminated.player1).toEqual([]); // input not mutated
+  });
+
+  test('crossing off a card that is not on the board is rejected', () => {
+    expect(() =>
+      reduce(playingMatch('player1'), {
+        type: 'CROSS_OFF',
+        player: 'player1',
+        pokemonId: 999,
+        eliminated: true,
+      }),
+    ).toThrow(/not on the board/i);
+  });
+});
+
 describe('game reducer skeleton — events not yet implemented', () => {
   const events: MatchEvent[] = [
-    { type: 'ASK', player: 'player1', question: 'Is it a fire type?' },
-    { type: 'ANSWER', player: 'player2', answer: 'No' },
     { type: 'GUESS', player: 'player1', pokemonId: 6 },
-    { type: 'CROSS_OFF', player: 'player1', pokemonId: 6, eliminated: true },
     { type: 'RESIGN', player: 'player2' },
     { type: 'CLAIM_INACTIVE', player: 'player1' },
   ];

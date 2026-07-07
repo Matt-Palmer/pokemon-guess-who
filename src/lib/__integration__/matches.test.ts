@@ -256,3 +256,158 @@ function clientFor(jwt: string) {
     expect(joinerSees).toBeNull();
   });
 });
+
+(hasLiveConfig ? describe : describe.skip)('turn loop (ask/answer) & private board marks', () => {
+  let host: SupabaseClient;
+  let joiner: SupabaseClient;
+
+  beforeAll(async () => {
+    const [jwtA, jwtB] = await Promise.all([
+      mintSessionToken(CLERK_TEST_USER_1!),
+      mintSessionToken(CLERK_TEST_USER_2!),
+    ]);
+    host = clientFor(jwtA);
+    joiner = clientFor(jwtB);
+    await host.from('profiles').upsert({ clerk_id: CLERK_TEST_USER_1, username: 'rlstest1' });
+    await joiner.from('profiles').upsert({ clerk_id: CLERK_TEST_USER_2, username: 'rlstest2' });
+  });
+
+  /** Drive a match all the way to active play (both secrets drawn). */
+  async function playingMatch() {
+    const { data: party } = await host.rpc('create_party');
+    await joiner.rpc('join_party', { p_code: party.party_code });
+    const { data: started } = await host.rpc('start_match', { p_match_id: party.id });
+    await host.rpc('draw_secret', { p_match_id: started.id, p_pokemon_id: started.board[0] });
+    await joiner.rpc('draw_secret', { p_match_id: started.id, p_pokemon_id: started.board[1] });
+    const { data: row } = await host
+      .from('matches')
+      .select('current_player')
+      .eq('id', started.id)
+      .single();
+    // The first turn is a server coin flip; resolve which client is the asker.
+    const asker = row!.current_player === 'player1' ? host : joiner;
+    const answerer = row!.current_player === 'player1' ? joiner : host;
+    return { match: started, current: row!.current_player as 'player1' | 'player2', asker, answerer };
+  }
+
+  test('the current player asks, the opponent answers, and the turn passes', async () => {
+    const { match, current, asker, answerer } = await playingMatch();
+
+    const { data: q, error: qErr } = await asker.rpc('ask_question', {
+      p_match_id: match.id,
+      p_question: 'Is it a fire type?',
+    });
+    expect(qErr).toBeNull();
+    expect(q.kind).toBe('question');
+
+    // The question flips the phase but keeps the turn with the asker.
+    const { data: afterAsk } = await asker
+      .from('matches')
+      .select('phase, current_player')
+      .eq('id', match.id)
+      .single();
+    expect(afterAsk?.phase).toBe('awaiting_answer');
+    expect(afterAsk?.current_player).toBe(current);
+
+    const { data: a, error: aErr } = await answerer.rpc('answer_question', {
+      p_match_id: match.id,
+      p_answer: 'No',
+    });
+    expect(aErr).toBeNull();
+    expect(a.kind).toBe('answer');
+
+    // Answering passes the turn and returns to awaiting_question.
+    const { data: afterAnswer } = await asker
+      .from('matches')
+      .select('phase, current_player')
+      .eq('id', match.id)
+      .single();
+    expect(afterAnswer?.phase).toBe('awaiting_question');
+    expect(afterAnswer?.current_player).not.toBe(current);
+
+    // The full thread is persisted and identical for both players.
+    const { data: askerThread } = await asker
+      .from('match_events')
+      .select('kind, body')
+      .eq('match_id', match.id)
+      .order('created_at', { ascending: true });
+    const { data: answererThread } = await answerer
+      .from('match_events')
+      .select('kind, body')
+      .eq('match_id', match.id)
+      .order('created_at', { ascending: true });
+    expect(askerThread).toEqual([
+      { kind: 'question', body: 'Is it a fire type?' },
+      { kind: 'answer', body: 'No' },
+    ]);
+    expect(answererThread).toEqual(askerThread);
+  });
+
+  test('a player cannot ask when it is not their turn', async () => {
+    const { match, answerer } = await playingMatch();
+    const { error } = await answerer.rpc('ask_question', {
+      p_match_id: match.id,
+      p_question: 'Is it blue?',
+    });
+    expect(error?.message).toContain('not_your_turn');
+  });
+
+  test('the asking player cannot answer their own question', async () => {
+    const { match, asker } = await playingMatch();
+    await asker.rpc('ask_question', { p_match_id: match.id, p_question: 'Fire?' });
+    const { error } = await asker.rpc('answer_question', { p_match_id: match.id, p_answer: 'Yes' });
+    expect(error?.message).toContain('not_your_turn');
+  });
+
+  test('cannot answer when no question is pending', async () => {
+    const { match, answerer } = await playingMatch();
+    const { error } = await answerer.rpc('answer_question', { p_match_id: match.id, p_answer: 'No' });
+    expect(error?.message).toContain('no_pending_question');
+  });
+
+  test('board marks are private — the opponent never sees them', async () => {
+    const { match } = await playingMatch();
+    const target = match.board[5];
+
+    const { error } = await host.rpc('set_board_mark', {
+      p_match_id: match.id,
+      p_pokemon_id: target,
+      p_eliminated: true,
+    });
+    expect(error).toBeNull();
+
+    // The owner sees their own mark…
+    const { data: mine } = await host
+      .from('board_marks')
+      .select('pokemon_id')
+      .eq('match_id', match.id);
+    expect(mine?.map((m) => m.pokemon_id)).toContain(target);
+
+    // …but the opponent's RLS scopes board_marks to their own rows only.
+    const { data: theirs } = await joiner
+      .from('board_marks')
+      .select('pokemon_id')
+      .eq('match_id', match.id);
+    expect(theirs).toEqual([]);
+
+    // Un-crossing removes the mark.
+    await host.rpc('set_board_mark', { p_match_id: match.id, p_pokemon_id: target, p_eliminated: false });
+    const { data: after } = await host
+      .from('board_marks')
+      .select('pokemon_id')
+      .eq('match_id', match.id)
+      .eq('pokemon_id', target);
+    expect(after).toEqual([]);
+  });
+
+  test('crossing off is not turn-gated — a player may mark on the opponent’s turn', async () => {
+    const { match, answerer } = await playingMatch();
+    // `answerer` is the non-current player; they can still mark their own board.
+    const { error } = await answerer.rpc('set_board_mark', {
+      p_match_id: match.id,
+      p_pokemon_id: match.board[3],
+      p_eliminated: true,
+    });
+    expect(error).toBeNull();
+  });
+});

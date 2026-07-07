@@ -1,4 +1,4 @@
-# Pokémon Guess Who — Handoff (Issue 3 complete + verified on two devices)
+# Pokémon Guess Who — Handoff (Issue 4 complete: turn loop, verified against live DB)
 
 **Project:** `/Users/Matt/Dev/pokemon-guess-who` — Expo/expo-router + Clerk auth + Supabase (Postgres + Realtime).
 Supabase project ref `azaemyxdzapolhqmcwpq`. Issues live in `issues/`, spec in `PRD.md`.
@@ -28,24 +28,56 @@ Supabase project ref `azaemyxdzapolhqmcwpq`. Issues live in `issues/`, spec in `
     before the JWT landed and then receive **no** RLS-gated `postgres_changes` — e.g. the host never saw the
     opponent join, so Start never enabled. Any *new* realtime subscription must follow the same
     setAuth-before-subscribe pattern.
-  - **34/34 tests pass**, `tsc` clean, `npm run lint` clean, security advisors clean (only the by-design
-    "authenticated can execute SECURITY DEFINER" warnings).
+- **Issue 4** (turns / questions / answers + cross-off): **complete, applied to the live DB, and verified by
+    the integration suite.**
+  - Reducer: `ASK`, `ANSWER`, `CROSS_OFF` in `src/lib/game/reducer.ts`. `ASK` (current player, non-empty)
+    flips `awaiting_question`→`awaiting_answer` keeping the turn with the asker; `ANSWER` (the *opponent* of the
+    asker) passes the turn (answerer becomes `currentPlayer`) and returns to `awaiting_question`. `CROSS_OFF`
+    toggles a card in `eliminated[player]` — **not turn-/phase-gated**, only ever touches the acting player's
+    own list. Pure/deterministic as before.
+  - Migration `00005_turns_questions_answers`: `match_events` (append-only Q/A thread, member-readable RLS,
+    on Realtime) and `board_marks` (**owner-only RLS** — a mark never reaches the opponent's device or Realtime
+    channel). RPCs `ask_question` / `answer_question` mirror the reducer and, in one txn, append the event **and**
+    transition the `matches` row; `set_board_mark` toggles a private mark (un-gated). All writes are RPC-only
+    (INSERT/UPDATE/DELETE revoked on both tables).
+  - Client (`src/lib/matches.ts`): `askQuestion` / `answerQuestion` / `setBoardMark` (+ friendly error map),
+    `useMatchEvents` (live thread, INSERT stream), `useBoardMarks` (live own-marks `Set`, INSERT+DELETE).
+    Both hooks follow the **setAuth-before-subscribe** rule.
+  - Match UI (`src/app/match/[id].tsx`) active-play: turn banner, live Q/A thread (auto-scrolls), turn-gated
+    ask input, answer prompt with Yes/No quick buttons + free text, **tap a card to cross off / long-press for
+    details**.
+  - **Realtime hardening (verified on two devices):**
+    - **Token-expiry refresh** — the Clerk session JWT lives only ~60s. Pinning one token onto a socket meant
+      every RLS-gated `postgres_changes` silently died after ~1 min (a match's first question arrived, nothing
+      after). New `useRealtimeAuth(supabase)` in `src/lib/supabase.ts` re-mints (`getToken({ skipCache: true })`)
+      and re-applies the token every 40s, and returns `authNow` for the race-free initial join. All three
+      subscription hooks (`useMatch`, `useMatchEvents`, `useBoardMarks`) use it. Proven against the live DB: a
+      no-refresh client missed a question asked at t=80s; the 40s-refresh client received it.
+    - **Optimistic cross-off** — `useBoardMarks` now returns `{ marks, toggle }`; `toggle` flips local state
+      immediately, calls `set_board_mark`, and rolls back on error. A player's own cross-offs no longer depend on
+      the realtime round-trip (which previously froze the board after one mark). Realtime stays as secondary sync.
+  - **51/51 tests pass** (25 reducer + 26 integration, incl. new turn-loop & board-mark-privacy blocks against
+    the live DB), `tsc` clean, `npm run lint` clean, security advisors clean (only the by-design
+    "authenticated can execute SECURITY DEFINER" warnings). ⚠️ New integration tests leave `matches` /
+    `match_events` / `board_marks` rows for the `rlstest1`/`rlstest2` profiles — clean up per the gotcha below.
 
-## Next steps — Issue 4: turns / questions / answers
+## Next steps — Issue 5: guessing / win-loss
 
-`issues/04-turns-questions-answers.md`. Blind draw already sets `current_player` / `phase` (and the
-`first_player` coin flip) on the 2nd draw, so play can start from there.
+`issues/05-guessing-win-loss.md`. The turn loop is in place (`current_player` / `phase`), so a `GUESS` action
+can hang off the same turn machinery.
 
-1. Build `ASK` and `ANSWER` in the reducer **test-first** (`src/lib/game/reducer.ts`) — strict alternating
-   turns, `phase` transitions (`awaiting_question` → `awaiting_answer` → back with turn passing to the answerer).
-   Crossing-off is NOT turn-gated (that's a later issue / private action).
-2. Add the DB adapter RPCs (mirror the reducer rules; the coin flip already happened in `draw_secret`).
-3. Wire the match UI: turn indicator, ask-a-question input (turn-gated), answer prompt for the opponent.
+1. Build `GUESS` in the reducer **test-first** — likely turn-gated, correct guess → win, wrong guess →
+   loss/penalty per the issue/PRD. Sets `status='completed'` + `winner_id` + `ended_at`.
+2. Add the DB adapter RPC (mirror the reducer; reveal both secrets on game end as the issue requires).
+3. Wire the match UI: a guess affordance (distinct from cross-off) and a win/loss end state.
 
 ## Gotchas for the new session
 
-- **Realtime subscriptions:** always `await supabase.realtime.setAuth()` before `.subscribe()` (see the bug
-  fix above) or RLS-gated changes silently won't arrive in the app.
+- **Realtime subscriptions:** use `useRealtimeAuth(supabase)` — `await authNow()` before `.subscribe()` (race-free
+  join) **and** it keeps the socket's token refreshed. Passing an explicit token to `setAuth` before subscribe is
+  necessary but NOT sufficient: the JWT expires in ~60s, so without the refresh loop RLS-gated changes silently
+  stop arriving mid-match. Also, don't make a user's *own* action depend on the realtime round-trip — update local
+  state optimistically (see `useBoardMarks`) and treat realtime as secondary sync.
 - **Run tests/tsc/lint with node on PATH:** `export PATH="/usr/local/Cellar/node/24.1.0/bin:$PATH"`
   (`cd` in Bash can reset cwd/PATH). Lint is `npm run lint` (`expo lint`) — plain `npx eslint` pulls the wrong
   version.

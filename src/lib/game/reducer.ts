@@ -38,14 +38,105 @@ function drawSecret(state: MatchState, player: PlayerSlot, pokemonId: number): M
   };
 }
 
+/**
+ * Ask the current turn's free-text question. Only the player whose turn it is may
+ * ask, and only while a question is expected. The turn does not pass yet — the
+ * asker stays `currentPlayer` and the phase flips to `awaiting_answer` so the
+ * *opponent* is the one prompted to respond. The question text itself is not held
+ * in this state; it lives in the persisted `match_events` thread.
+ */
+function ask(state: MatchState, player: PlayerSlot, question: string): MatchState {
+  if (state.status !== 'active') {
+    throw new Error('Questions can only be asked during an active match');
+  }
+  if (state.phase !== 'awaiting_question') {
+    throw new Error('A question is not expected right now');
+  }
+  if (state.currentPlayer !== player) {
+    throw new Error('It is not your turn to ask');
+  }
+  if (question.trim().length === 0) {
+    throw new Error('A question cannot be empty');
+  }
+
+  return {
+    ...state,
+    phase: 'awaiting_answer',
+    lastActivityAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Answer the pending question. Only the opponent of the asker (i.e. *not* the
+ * current player) may answer, and only while an answer is expected. Answering
+ * passes the turn: the answerer becomes `currentPlayer` and the phase returns to
+ * `awaiting_question`.
+ */
+function answer(state: MatchState, player: PlayerSlot, text: string): MatchState {
+  if (state.status !== 'active') {
+    throw new Error('Answers can only be given during an active match');
+  }
+  if (state.phase !== 'awaiting_answer') {
+    throw new Error('There is no question to answer');
+  }
+  if (state.currentPlayer === player) {
+    throw new Error('The asking player cannot answer their own question');
+  }
+  if (text.trim().length === 0) {
+    throw new Error('An answer cannot be empty');
+  }
+
+  return {
+    ...state,
+    currentPlayer: player,
+    phase: 'awaiting_question',
+    lastActivityAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Cross off (or un-cross) a card on the acting player's *own* board. These marks
+ * are private — they never touch the opponent's list and give away no
+ * information — and are deliberately NOT turn-gated: a player may re-mark their
+ * board at any point during an active match, on or off their turn.
+ */
+function crossOff(
+  state: MatchState,
+  player: PlayerSlot,
+  pokemonId: number,
+  eliminated: boolean,
+): MatchState {
+  if (state.status !== 'active') {
+    throw new Error('Cards can only be crossed off during an active match');
+  }
+  if (!state.board.includes(pokemonId)) {
+    throw new Error('That card is not on the board');
+  }
+
+  const marks = state.eliminated[player];
+  const nextMarks = eliminated
+    ? marks.includes(pokemonId)
+      ? marks
+      : [...marks, pokemonId]
+    : marks.filter((id) => id !== pokemonId);
+
+  return {
+    ...state,
+    eliminated: { ...state.eliminated, [player]: nextMarks },
+  };
+}
+
 export function reduce(state: MatchState, event: MatchEvent): MatchState {
   switch (event.type) {
     case 'DRAW_SECRET':
       return drawSecret(state, event.player, event.pokemonId);
     case 'ASK':
+      return ask(state, event.player, event.question);
     case 'ANSWER':
-    case 'GUESS':
+      return answer(state, event.player, event.answer);
     case 'CROSS_OFF':
+      return crossOff(state, event.player, event.pokemonId, event.eliminated);
+    case 'GUESS':
     case 'RESIGN':
     case 'CLAIM_INACTIVE':
       throw new Error(`${event.type} not implemented yet`);

@@ -1,11 +1,30 @@
 import { useUser } from '@clerk/clerk-expo';
 import { Image } from 'expo-image';
 import { useLocalSearchParams } from 'expo-router';
-import { useMemo, useState } from 'react';
-import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { useMemo, useRef, useState } from 'react';
+import {
+  ActivityIndicator,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from 'react-native';
 
 import { colors, typeColors } from '@/constants/colors';
-import { drawSecret, PokemonCard, useBoardPokemon, useMatch, useMySecret } from '@/lib/matches';
+import {
+  answerQuestion,
+  askQuestion,
+  drawSecret,
+  PokemonCard,
+  useBoardMarks,
+  useBoardPokemon,
+  useMatch,
+  useMatchEvents,
+  useMatchPlayers,
+  useMySecret,
+} from '@/lib/matches';
 import { useSupabase } from '@/lib/supabase';
 
 export default function MatchScreen() {
@@ -15,9 +34,16 @@ export default function MatchScreen() {
   const { match, loading, error } = useMatch(id);
   const cards = useBoardPokemon(match?.board);
   const { secret: mySecretId, refetch: refetchSecret } = useMySecret(id);
+  const events = useMatchEvents(id, match?.last_activity_at);
+  const { marks, toggle: toggleMark } = useBoardMarks(id);
+  const players = useMatchPlayers(id);
   const [selected, setSelected] = useState<PokemonCard | null>(null);
   const [drawing, setDrawing] = useState(false);
   const [drawError, setDrawError] = useState<string | null>(null);
+  const [input, setInput] = useState('');
+  const [sending, setSending] = useState(false);
+  const [turnError, setTurnError] = useState<string | null>(null);
+  const threadRef = useRef<ScrollView>(null);
 
   const mySlot = match ? (match.player1_id === user?.id ? 'player1' : 'player2') : null;
   const bothDrawn = Boolean(match?.player1_drawn && match?.player2_drawn);
@@ -42,6 +68,46 @@ export default function MatchScreen() {
       setDrawError(err?.message ?? 'Could not draw that card.');
     } finally {
       setDrawing(false);
+    }
+  };
+
+  const onSend = async () => {
+    if (!id || sending) return;
+    const text = input.trim();
+    if (!text) return;
+    setTurnError(null);
+    setSending(true);
+    try {
+      if (iAsk) await askQuestion(supabase, id, text);
+      else if (iAnswer) await answerQuestion(supabase, id, text);
+      setInput('');
+    } catch (err: any) {
+      setTurnError(err?.message ?? 'Something went wrong.');
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const sendAnswer = async (text: string) => {
+    if (!id || sending) return;
+    setTurnError(null);
+    setSending(true);
+    try {
+      await answerQuestion(supabase, id, text);
+      setInput('');
+    } catch (err: any) {
+      setTurnError(err?.message ?? 'Something went wrong.');
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const onToggleCross = async (card: PokemonCard) => {
+    setTurnError(null);
+    try {
+      await toggleMark(card.id);
+    } catch (err: any) {
+      setTurnError(err?.message ?? 'Could not update that card.');
     }
   };
 
@@ -116,48 +182,167 @@ export default function MatchScreen() {
     );
   }
 
-  // ── Active play: all 24 cards face-up. ──
+  // ── Active play: turn loop of questions & answers over a face-up board. ──
+  const oppSlot = mySlot === 'player1' ? 'player2' : 'player1';
+  const nameFor = (slot: 'player1' | 'player2', fallback: string) => {
+    const cid = slot === 'player1' ? match.player1_id : match.player2_id;
+    return (cid && players[cid]?.username) || fallback;
+  };
+  const oppName = nameFor(oppSlot, 'your opponent');
+
+  const isMyTurn = match.current_player === mySlot;
+  const iAsk = match.phase === 'awaiting_question' && isMyTurn;
+  // The answerer is the opponent of the asker (current_player).
+  const iAnswer = match.phase === 'awaiting_answer' && match.current_player !== mySlot;
+
+  const banner =
+    match.phase === 'awaiting_question'
+      ? isMyTurn
+        ? 'Your turn — ask a question'
+        : `${oppName}'s turn to ask…`
+      : iAnswer
+        ? 'Answer the question'
+        : `Waiting for ${oppName} to answer…`;
+
   return (
     <View style={styles.container}>
-      <ScrollView contentContainerStyle={styles.grid}>
-        {cards.map((card) => (
-          <Pressable
-            key={card.id}
-            style={[
-              styles.card,
-              selected?.id === card.id && styles.cardSelected,
-              card.id === mySecretId && styles.cardMine,
-            ]}
-            onPress={() => setSelected(card)}>
-            <Image source={{ uri: card.sprite_url }} style={styles.sprite} contentFit="contain" />
-            <Text style={styles.name} numberOfLines={1}>
-              {card.name}
-            </Text>
-          </Pressable>
-        ))}
+      <View style={styles.turnBanner}>
+        <Text style={styles.turnText}>{banner}</Text>
+        <Text style={styles.turnHint}>Tap a card to cross it off · long-press for details</Text>
+      </View>
+
+      <ScrollView style={styles.board} contentContainerStyle={styles.grid}>
+        {cards.map((card) => {
+          const crossed = marks.has(card.id);
+          return (
+            <Pressable
+              key={card.id}
+              style={[styles.card, card.id === mySecretId && styles.cardMine]}
+              onPress={() => onToggleCross(card)}
+              onLongPress={() => setSelected(card)}>
+              <Image
+                source={{ uri: card.sprite_url }}
+                style={[styles.sprite, crossed && styles.spriteCrossed]}
+                contentFit="contain"
+              />
+              <Text
+                style={[styles.name, crossed && styles.nameCrossed]}
+                numberOfLines={1}>
+                {card.name}
+              </Text>
+              {crossed && (
+                <View style={styles.crossOverlay}>
+                  <Text style={styles.crossMark}>✕</Text>
+                </View>
+              )}
+            </Pressable>
+          );
+        })}
         {cards.length === 0 && <Text style={styles.loadingBoard}>Loading board…</Text>}
       </ScrollView>
 
-      {selected && (
-        <View style={styles.detailPanel}>
-          <Pressable style={styles.detailClose} onPress={() => setSelected(null)}>
-            <Text style={styles.detailCloseText}>✕</Text>
-          </Pressable>
-          <Image source={{ uri: selected.sprite_url }} style={styles.detailSprite} contentFit="contain" />
-          <View style={styles.detailInfo}>
-            <Text style={styles.detailName}>{selected.name}</Text>
-            <View style={styles.typeRow}>
-              {selected.types.map((type) => (
-                <View
-                  key={type}
-                  style={[styles.typeChip, { backgroundColor: typeColors[type] ?? colors.textMuted }]}>
-                  <Text style={styles.typeChipText}>{type}</Text>
-                </View>
-              ))}
-            </View>
-            <Text style={styles.detailGen}>Generation {selected.generation}</Text>
+      <View style={styles.threadPanel}>
+        <ScrollView
+          ref={threadRef}
+          style={styles.thread}
+          contentContainerStyle={styles.threadContent}
+          onContentSizeChange={() => threadRef.current?.scrollToEnd({ animated: true })}>
+          {events.length === 0 && (
+            <Text style={styles.threadEmpty}>No questions asked yet.</Text>
+          )}
+          {events.map((ev) => {
+            const mine = ev.author_id === user?.id;
+            const author = mine ? 'You' : nameFor(ev.author_slot, 'Opponent');
+            return (
+              <View key={ev.id} style={[styles.eventRow, mine && styles.eventRowMine]}>
+                <Text style={styles.eventMeta}>
+                  {author} · {ev.kind === 'question' ? 'asked' : 'answered'}
+                </Text>
+                <Text style={[styles.eventBody, ev.kind === 'answer' && styles.eventAnswer]}>
+                  {ev.body}
+                </Text>
+              </View>
+            );
+          })}
+        </ScrollView>
+
+        {turnError && <Text style={styles.error}>{turnError}</Text>}
+
+        {iAnswer && (
+          <View style={styles.quickRow}>
+            <Pressable
+              style={[styles.quickBtn, sending && styles.sendBtnDisabled]}
+              disabled={sending}
+              onPress={() => sendAnswer('Yes')}>
+              <Text style={styles.quickText}>Yes</Text>
+            </Pressable>
+            <Pressable
+              style={[styles.quickBtn, sending && styles.sendBtnDisabled]}
+              disabled={sending}
+              onPress={() => sendAnswer('No')}>
+              <Text style={styles.quickText}>No</Text>
+            </Pressable>
           </View>
-        </View>
+        )}
+
+        {iAsk || iAnswer ? (
+          <View style={styles.inputRow}>
+            <TextInput
+              style={styles.input}
+              value={input}
+              onChangeText={setInput}
+              placeholder={iAsk ? 'Ask a yes/no question…' : 'Type your answer…'}
+              placeholderTextColor={colors.textMuted}
+              editable={!sending}
+              onSubmitEditing={onSend}
+              returnKeyType="send"
+            />
+            <Pressable
+              style={[styles.sendBtn, (sending || !input.trim()) && styles.sendBtnDisabled]}
+              disabled={sending || !input.trim()}
+              onPress={onSend}>
+              <Text style={styles.sendText}>Send</Text>
+            </Pressable>
+          </View>
+        ) : (
+          <Text style={styles.waitingHint}>
+            {match.phase === 'awaiting_answer'
+              ? `Waiting for ${oppName} to answer…`
+              : `Waiting for ${oppName}…`}
+          </Text>
+        )}
+      </View>
+
+      {selected && (
+        <>
+          <Pressable
+            style={styles.detailBackdrop}
+            onPress={() => setSelected(null)}
+            accessibilityLabel="Close details"
+          />
+          <View style={styles.detailPanel}>
+            <Pressable
+              style={styles.detailClose}
+              hitSlop={16}
+              onPress={() => setSelected(null)}>
+              <Text style={styles.detailCloseText}>✕</Text>
+            </Pressable>
+            <Image source={{ uri: selected.sprite_url }} style={styles.detailSprite} contentFit="contain" />
+            <View style={styles.detailInfo}>
+              <Text style={styles.detailName}>{selected.name}</Text>
+              <View style={styles.typeRow}>
+                {selected.types.map((type) => (
+                  <View
+                    key={type}
+                    style={[styles.typeChip, { backgroundColor: typeColors[type] ?? colors.textMuted }]}>
+                    <Text style={styles.typeChipText}>{type}</Text>
+                  </View>
+                ))}
+              </View>
+              <Text style={styles.detailGen}>Generation {selected.generation}</Text>
+            </View>
+          </View>
+        </>
       )}
     </View>
   );
@@ -166,6 +351,7 @@ export default function MatchScreen() {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.background },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.background },
+  board: { flex: 1 },
   grid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
@@ -184,11 +370,76 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     padding: 4,
   },
-  cardSelected: { borderColor: colors.selected, backgroundColor: colors.selectedBg },
   cardMine: { borderColor: colors.accent, borderWidth: 2.5 },
   sprite: { width: '100%', height: '70%' },
+  spriteCrossed: { opacity: 0.2 },
   name: { fontSize: 10, fontWeight: '600', color: colors.text, textTransform: 'capitalize' },
+  nameCrossed: { color: colors.textMuted, textDecorationLine: 'line-through' },
+  crossOverlay: { ...StyleSheet.absoluteFillObject, alignItems: 'center', justifyContent: 'center' },
+  crossMark: { fontSize: 34, fontWeight: '900', color: colors.wrong, opacity: 0.85 },
   loadingBoard: { color: colors.textMuted, textAlign: 'center', width: '100%', marginTop: 40 },
+
+  // Turn banner
+  turnBanner: {
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    backgroundColor: colors.card,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.border,
+    alignItems: 'center',
+  },
+  turnText: { fontSize: 16, fontWeight: '800', color: colors.text },
+  turnHint: { fontSize: 11, color: colors.textMuted, marginTop: 2 },
+
+  // Q/A thread + input
+  threadPanel: {
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+    backgroundColor: colors.card,
+    paddingHorizontal: 12,
+    paddingTop: 8,
+    paddingBottom: 12,
+  },
+  thread: { maxHeight: 150 },
+  threadContent: { paddingBottom: 4 },
+  threadEmpty: { color: colors.textMuted, textAlign: 'center', paddingVertical: 12 },
+  eventRow: { marginBottom: 8, alignItems: 'flex-start' },
+  eventRowMine: { alignItems: 'flex-end' },
+  eventMeta: { fontSize: 11, color: colors.textMuted, fontWeight: '600' },
+  eventBody: { fontSize: 15, color: colors.text, marginTop: 1 },
+  eventAnswer: { fontWeight: '700' },
+  quickRow: { flexDirection: 'row', gap: 10, marginTop: 4, marginBottom: 8 },
+  quickBtn: {
+    flex: 1,
+    paddingVertical: 10,
+    borderRadius: 10,
+    backgroundColor: colors.selectedBg,
+    borderWidth: 1,
+    borderColor: colors.selected,
+    alignItems: 'center',
+  },
+  quickText: { fontWeight: '800', color: colors.text, fontSize: 15 },
+  inputRow: { flexDirection: 'row', gap: 8, alignItems: 'center', marginTop: 4 },
+  input: {
+    flex: 1,
+    backgroundColor: colors.background,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    color: colors.text,
+    fontSize: 15,
+  },
+  sendBtn: {
+    paddingHorizontal: 18,
+    paddingVertical: 11,
+    borderRadius: 10,
+    backgroundColor: colors.primary,
+  },
+  sendBtnDisabled: { opacity: 0.5 },
+  sendText: { color: colors.onPrimary, fontWeight: '800' },
+  waitingHint: { color: colors.textMuted, textAlign: 'center', marginTop: 6, fontStyle: 'italic' },
 
   // Draw phase
   drawHeader: { padding: 16, alignItems: 'center' },
@@ -212,16 +463,28 @@ const styles = StyleSheet.create({
   secretSprite: { width: 56, height: 56 },
   secretName: { fontSize: 18, fontWeight: '700', color: colors.text, textTransform: 'capitalize' },
 
+  detailBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.35)',
+    zIndex: 10,
+  },
   detailPanel: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
     flexDirection: 'row',
     alignItems: 'center',
     backgroundColor: colors.card,
     borderTopWidth: 1,
     borderTopColor: colors.border,
     padding: 16,
+    paddingTop: 28,
     gap: 16,
+    zIndex: 11,
+    elevation: 11,
   },
-  detailClose: { position: 'absolute', top: 8, right: 12, padding: 4 },
+  detailClose: { position: 'absolute', top: 8, right: 12, padding: 6, zIndex: 12 },
   detailCloseText: { color: colors.textMuted, fontSize: 16, fontWeight: '700' },
   detailSprite: { width: 72, height: 72 },
   detailInfo: { flex: 1 },

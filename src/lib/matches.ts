@@ -1,7 +1,7 @@
 import { RealtimeChannel, SupabaseClient } from '@supabase/supabase-js';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
-import { useSupabase } from '@/lib/supabase';
+import { useRealtimeAuth, useSupabase } from '@/lib/supabase';
 
 export type MatchStatus = 'lobby' | 'active' | 'completed' | 'abandoned';
 
@@ -39,6 +39,17 @@ export type MatchPlayer = {
   clerk_id: string;
   username: string;
   avatar: string | null;
+};
+
+/** One entry in a match's question/answer thread. */
+export type MatchEventRow = {
+  id: string;
+  match_id: string;
+  kind: 'question' | 'answer';
+  author_id: string;
+  author_slot: 'player1' | 'player2';
+  body: string;
+  created_at: string;
 };
 
 export type PokemonCard = {
@@ -134,6 +145,244 @@ export function useMySecret(matchId: string | undefined) {
   return { secret, refetch };
 }
 
+const TURN_ERRORS: Record<string, string> = {
+  not_your_turn: "It's not your turn.",
+  not_awaiting_question: 'A question has already been asked.',
+  no_pending_question: "There's no question to answer.",
+  empty_question: 'Type a question first.',
+  empty_answer: 'Type an answer first.',
+  match_not_active: 'This game is no longer active.',
+  not_a_player: "You're not a player in this match.",
+  not_on_board: "That card isn't on the board.",
+};
+
+function friendlyTurnError(message: string, fallback: string): Error {
+  return new Error(TURN_ERRORS[message.trim()] ?? fallback);
+}
+
+/**
+ * Post the current turn's question. The server enforces turn order and phase and
+ * returns the appended thread event; the shared phase change arrives via Realtime.
+ */
+export async function askQuestion(
+  supabase: SupabaseClient,
+  matchId: string,
+  question: string,
+): Promise<MatchEventRow> {
+  const { data, error } = await supabase.rpc('ask_question', {
+    p_match_id: matchId,
+    p_question: question,
+  });
+  if (error) throw friendlyTurnError(error.message, 'Could not post that question.');
+  return data as MatchEventRow;
+}
+
+/**
+ * Answer the pending question. Only the opponent of the asker may answer; on
+ * success the turn passes to them.
+ */
+export async function answerQuestion(
+  supabase: SupabaseClient,
+  matchId: string,
+  answer: string,
+): Promise<MatchEventRow> {
+  const { data, error } = await supabase.rpc('answer_question', {
+    p_match_id: matchId,
+    p_answer: answer,
+  });
+  if (error) throw friendlyTurnError(error.message, 'Could not post that answer.');
+  return data as MatchEventRow;
+}
+
+/**
+ * Cross off (or un-cross) a card on the caller's own board. Private and not
+ * turn-gated — it only ever writes the caller's own row.
+ */
+export async function setBoardMark(
+  supabase: SupabaseClient,
+  matchId: string,
+  pokemonId: number,
+  eliminated: boolean,
+): Promise<void> {
+  const { error } = await supabase.rpc('set_board_mark', {
+    p_match_id: matchId,
+    p_pokemon_id: pokemonId,
+    p_eliminated: eliminated,
+  });
+  if (error) throw friendlyTurnError(error.message, 'Could not update that card.');
+}
+
+/**
+ * Loads a match's question/answer thread and keeps it live.
+ *
+ * Two update paths, so the thread never gets stuck:
+ *  - A realtime `postgres_changes` INSERT stream appends new entries instantly.
+ *  - An authoritative refetch runs whenever `revalidateKey` changes. Pass the
+ *    match's `last_activity_at` here: every ask/answer bumps it *and* is
+ *    delivered to both players via {@link useMatch}'s (reliable) `matches`
+ *    subscription — so the thread reloads on the same signal that flips the turn
+ *    banner, even if a `match_events` broadcast is ever missed.
+ */
+export function useMatchEvents(matchId: string | undefined, revalidateKey?: string) {
+  const supabase = useSupabase();
+  const authNow = useRealtimeAuth(supabase);
+  const [events, setEvents] = useState<MatchEventRow[]>([]);
+
+  // Authoritative load: on mount and whenever the match changes (turn advanced).
+  useEffect(() => {
+    if (!matchId) return;
+    let cancelled = false;
+
+    supabase
+      .from('match_events')
+      .select('id, match_id, kind, author_id, author_slot, body, created_at')
+      .eq('match_id', matchId)
+      .order('created_at', { ascending: true })
+      .then(({ data }) => {
+        if (cancelled || !data) return;
+        // Replace wholesale — this is the source of truth for the thread.
+        setEvents(data as MatchEventRow[]);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [matchId, supabase, revalidateKey]);
+
+  // Fast path: stream inserts in real time (deduped against the refetch).
+  useEffect(() => {
+    if (!matchId) return;
+    let cancelled = false;
+    let channel: RealtimeChannel | undefined;
+
+    // Authorize the socket with a fresh Clerk JWT before subscribing, and keep it
+    // refreshed (useRealtimeAuth) so events keep arriving past the ~60s token life.
+    (async () => {
+      await authNow();
+      if (cancelled) return;
+      channel = supabase
+        .channel(`match_events:${matchId}`)
+        .on(
+          'postgres_changes',
+          { event: 'INSERT', schema: 'public', table: 'match_events', filter: `match_id=eq.${matchId}` },
+          (payload) => {
+            if (cancelled) return;
+            const row = payload.new as MatchEventRow;
+            setEvents((prev) => (prev.some((e) => e.id === row.id) ? prev : [...prev, row]));
+          },
+        )
+        .subscribe();
+    })();
+
+    return () => {
+      cancelled = true;
+      if (channel) supabase.removeChannel(channel);
+    };
+  }, [matchId, supabase, authNow]);
+
+  return events;
+}
+
+/**
+ * The caller's own crossed-off cards for a match, plus a `toggle` to flip one.
+ *
+ * Marks are private: the RLS policy on `board_marks` only ever exposes the
+ * owner's rows, so this only reflects — and only receives Realtime changes for —
+ * the caller's board.
+ *
+ * `toggle` updates local state **optimistically** and then writes via the RPC,
+ * rolling back only if the write fails. Your own cross-offs must feel instant and
+ * must not depend on the Realtime round-trip: if the `board_marks` broadcast were
+ * the only thing that flipped the checkmark, a single dropped message would freeze
+ * your board. Realtime is kept purely as a secondary sync (e.g. a second device
+ * signed in as the same player); incoming events reconcile idempotently.
+ */
+export function useBoardMarks(matchId: string | undefined) {
+  const supabase = useSupabase();
+  const authNow = useRealtimeAuth(supabase);
+  const [marks, setMarks] = useState<Set<number>>(new Set());
+  // Mirror of `marks` for reading the latest value inside `toggle` without
+  // making the callback depend on (and churn with) every mark change.
+  const marksRef = useRef(marks);
+  marksRef.current = marks;
+
+  const toggle = useCallback(
+    async (pokemonId: number) => {
+      if (!matchId) return;
+      const eliminated = !marksRef.current.has(pokemonId);
+      // Optimistic: flip immediately so the tap feels instant.
+      setMarks((prev) => {
+        const next = new Set(prev);
+        if (eliminated) next.add(pokemonId);
+        else next.delete(pokemonId);
+        return next;
+      });
+      try {
+        await setBoardMark(supabase, matchId, pokemonId, eliminated);
+      } catch (err) {
+        // Roll the optimistic change back on failure.
+        setMarks((prev) => {
+          const next = new Set(prev);
+          if (eliminated) next.delete(pokemonId);
+          else next.add(pokemonId);
+          return next;
+        });
+        throw err;
+      }
+    },
+    [matchId, supabase],
+  );
+
+  useEffect(() => {
+    if (!matchId) {
+      setMarks(new Set());
+      return;
+    }
+    let cancelled = false;
+    let channel: RealtimeChannel | undefined;
+
+    supabase
+      .from('board_marks')
+      .select('pokemon_id')
+      .eq('match_id', matchId)
+      .then(({ data }) => {
+        if (cancelled || !data) return;
+        setMarks(new Set((data as { pokemon_id: number }[]).map((r) => r.pokemon_id)));
+      });
+
+    (async () => {
+      await authNow();
+      if (cancelled) return;
+      channel = supabase
+        .channel(`board_marks:${matchId}`)
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'board_marks', filter: `match_id=eq.${matchId}` },
+          (payload) => {
+            if (cancelled) return;
+            setMarks((prev) => {
+              const next = new Set(prev);
+              if (payload.eventType === 'DELETE') {
+                next.delete((payload.old as { pokemon_id: number }).pokemon_id);
+              } else {
+                next.add((payload.new as { pokemon_id: number }).pokemon_id);
+              }
+              return next;
+            });
+          },
+        )
+        .subscribe();
+    })();
+
+    return () => {
+      cancelled = true;
+      if (channel) supabase.removeChannel(channel);
+    };
+  }, [matchId, supabase, authNow]);
+
+  return { marks, toggle };
+}
+
 /**
  * Loads a match and keeps it live via Postgres Changes. The table's membership
  * RLS policy means the subscription only ever delivers this match's rows to its
@@ -141,6 +390,7 @@ export function useMySecret(matchId: string | undefined) {
  */
 export function useMatch(matchId: string | undefined) {
   const supabase = useSupabase();
+  const authNow = useRealtimeAuth(supabase);
   const [match, setMatch] = useState<MatchRow | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -163,12 +413,15 @@ export function useMatch(matchId: string | undefined) {
         setLoading(false);
       });
 
-    // Authenticate the Realtime socket with the Clerk JWT *before* subscribing.
-    // supabase-js applies Realtime auth asynchronously at client construction,
-    // so a channel that joins first binds its RLS check to the anon role and
-    // then silently receives no postgres_changes — e.g. the lobby host would
-    // never see the opponent join. Awaiting setAuth() forces the token first.
-    supabase.realtime.setAuth().then(() => {
+    // Authenticate the Realtime socket with the Clerk JWT *before* subscribing
+    // (race-free join) and keep it refreshed for the life of the match. The
+    // no-argument setAuth() would race the channel join — the channel binds its
+    // RLS check to the anon role and silently receives no postgres_changes (e.g.
+    // the lobby host would never see the opponent join). Just as importantly, the
+    // token lives ~60s: without the periodic refresh in useRealtimeAuth the socket
+    // would deauthorize mid-match and stop delivering turn/phase updates.
+    (async () => {
+      await authNow();
       if (cancelled) return;
       channel = supabase
         .channel(`match:${matchId}`)
@@ -180,13 +433,13 @@ export function useMatch(matchId: string | undefined) {
           },
         )
         .subscribe();
-    });
+    })();
 
     return () => {
       cancelled = true;
       if (channel) supabase.removeChannel(channel);
     };
-  }, [matchId, supabase]);
+  }, [matchId, supabase, authNow]);
 
   return { match, loading, error };
 }
