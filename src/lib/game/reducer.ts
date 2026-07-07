@@ -126,6 +126,59 @@ function crossOff(
   };
 }
 
+/**
+ * Guess the opponent's secret. Offered instead of asking, so it is gated exactly
+ * like {@link ask}: only the current player, only while a question is expected —
+ * you may ask XOR guess on your turn, never both. The guess is validated against
+ * the opponent's stored secret:
+ *  - Correct → the guesser wins and the match ends (`completed` + `winnerId` +
+ *    `endedAt`).
+ *  - Wrong → the missed card is auto-crossed on the *guesser's own* board (a
+ *    private mark) and the turn passes to the opponent, back to `awaiting_question`.
+ *
+ * A wrong guess only ever mutates the guesser's own `eliminated` list and flips
+ * the turn — the same signal a normal answer produces — so what was guessed, and
+ * that a guess happened at all, stays private to the guesser.
+ */
+function guess(state: MatchState, player: PlayerSlot, pokemonId: number): MatchState {
+  if (state.status !== 'active') {
+    throw new Error('Guesses can only be made during an active match');
+  }
+  if (state.phase !== 'awaiting_question') {
+    throw new Error('You can only guess at the start of your turn');
+  }
+  if (state.currentPlayer !== player) {
+    throw new Error('It is not your turn to guess');
+  }
+  if (!state.board.includes(pokemonId)) {
+    throw new Error('That card is not on the board');
+  }
+
+  const opponent: PlayerSlot = player === 'player1' ? 'player2' : 'player1';
+  const opponentSecret = opponent === 'player1' ? state.player1Secret : state.player2Secret;
+  const now = new Date().toISOString();
+
+  if (pokemonId === opponentSecret) {
+    return {
+      ...state,
+      status: 'completed',
+      winnerId: player === 'player1' ? state.player1Id : state.player2Id,
+      endedAt: now,
+      lastActivityAt: now,
+    };
+  }
+
+  const marks = state.eliminated[player];
+  const nextMarks = marks.includes(pokemonId) ? marks : [...marks, pokemonId];
+  return {
+    ...state,
+    eliminated: { ...state.eliminated, [player]: nextMarks },
+    currentPlayer: opponent,
+    phase: 'awaiting_question',
+    lastActivityAt: now,
+  };
+}
+
 export function reduce(state: MatchState, event: MatchEvent): MatchState {
   switch (event.type) {
     case 'DRAW_SECRET':
@@ -137,6 +190,7 @@ export function reduce(state: MatchState, event: MatchEvent): MatchState {
     case 'CROSS_OFF':
       return crossOff(state, event.player, event.pokemonId, event.eliminated);
     case 'GUESS':
+      return guess(state, event.player, event.pokemonId);
     case 'RESIGN':
     case 'CLAIM_INACTIVE':
       throw new Error(`${event.type} not implemented yet`);

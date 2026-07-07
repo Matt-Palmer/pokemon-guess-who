@@ -411,3 +411,147 @@ function clientFor(jwt: string) {
     expect(error).toBeNull();
   });
 });
+
+(hasLiveConfig ? describe : describe.skip)('guessing & win/loss (guess / match_result)', () => {
+  let host: SupabaseClient;
+  let joiner: SupabaseClient;
+
+  beforeAll(async () => {
+    const [jwtA, jwtB] = await Promise.all([
+      mintSessionToken(CLERK_TEST_USER_1!),
+      mintSessionToken(CLERK_TEST_USER_2!),
+    ]);
+    host = clientFor(jwtA);
+    joiner = clientFor(jwtB);
+    await host.from('profiles').upsert({ clerk_id: CLERK_TEST_USER_1, username: 'rlstest1' });
+    await joiner.from('profiles').upsert({ clerk_id: CLERK_TEST_USER_2, username: 'rlstest2' });
+  });
+
+  /**
+   * Drive a match to active play and resolve the coin-flipped first turn.
+   * host is player1 and draws board[0]; joiner is player2 and draws board[1] —
+   * so the current player's opponent's secret is a known board card.
+   */
+  async function playingMatch() {
+    const { data: party } = await host.rpc('create_party');
+    await joiner.rpc('join_party', { p_code: party.party_code });
+    const { data: started } = await host.rpc('start_match', { p_match_id: party.id });
+    await host.rpc('draw_secret', { p_match_id: started.id, p_pokemon_id: started.board[0] });
+    await joiner.rpc('draw_secret', { p_match_id: started.id, p_pokemon_id: started.board[1] });
+    const { data: row } = await host
+      .from('matches')
+      .select('current_player')
+      .eq('id', started.id)
+      .single();
+    const currentIsP1 = row!.current_player === 'player1';
+    const guesser = currentIsP1 ? host : joiner;
+    const opponent = currentIsP1 ? joiner : host;
+    const opponentSecret = currentIsP1 ? started.board[1] : started.board[0];
+    const wrongCard = (started.board as number[]).find((c) => c !== opponentSecret)!;
+    return { match: started, guesser, opponent, opponentSecret, wrongCard, currentIsP1 };
+  }
+
+  test('a correct guess wins the match and reveals both secrets to both players', async () => {
+    const { match, guesser, opponent, opponentSecret, currentIsP1 } = await playingMatch();
+    const winnerId = currentIsP1 ? CLERK_TEST_USER_1 : CLERK_TEST_USER_2;
+
+    const { data: result, error } = await guesser.rpc('guess', {
+      p_match_id: match.id,
+      p_pokemon_id: opponentSecret,
+    });
+    expect(error).toBeNull();
+    expect(result.correct).toBe(true);
+    expect(result.winner_id).toBe(winnerId);
+
+    const { data: row } = await guesser
+      .from('matches')
+      .select('status, winner_id, ended_at')
+      .eq('id', match.id)
+      .single();
+    expect(row?.status).toBe('completed');
+    expect(row?.winner_id).toBe(winnerId);
+    expect(row?.ended_at).not.toBeNull();
+
+    // Once the game is over, both players can read the reveal (both secrets).
+    for (const client of [guesser, opponent]) {
+      const { data: reveal } = await client.rpc('match_result', { p_match_id: match.id });
+      expect(reveal).toHaveLength(1);
+      expect(reveal[0].winner_id).toBe(winnerId);
+      expect(reveal[0].player1_secret).toBe(match.board[0]);
+      expect(reveal[0].player2_secret).toBe(match.board[1]);
+    }
+  });
+
+  test('a wrong guess auto-crosses the missed card, passes the turn, and stays private', async () => {
+    const { match, guesser, opponent, wrongCard, currentIsP1 } = await playingMatch();
+
+    const { data: result, error } = await guesser.rpc('guess', {
+      p_match_id: match.id,
+      p_pokemon_id: wrongCard,
+    });
+    expect(error).toBeNull();
+    expect(result.correct).toBe(false);
+    // A wrong guess never returns the opponent's secret, even to the guesser.
+    expect(result.winner_id).toBeNull();
+    expect(result.opponent_secret).toBeNull();
+
+    // The match stays active, the turn passes, and the phase returns to asking.
+    const { data: row } = await guesser
+      .from('matches')
+      .select('status, winner_id, current_player, phase')
+      .eq('id', match.id)
+      .single();
+    expect(row?.status).toBe('active');
+    expect(row?.winner_id).toBeNull();
+    expect(row?.current_player).toBe(currentIsP1 ? 'player2' : 'player1');
+    expect(row?.phase).toBe('awaiting_question');
+
+    // The missed card is auto-crossed on the guesser's own (private) board…
+    const { data: mine } = await guesser
+      .from('board_marks')
+      .select('pokemon_id')
+      .eq('match_id', match.id);
+    expect(mine?.map((m) => m.pokemon_id)).toContain(wrongCard);
+
+    // …and nothing about the guess reaches the opponent: no mark, no thread entry.
+    const { data: theirMarks } = await opponent
+      .from('board_marks')
+      .select('pokemon_id')
+      .eq('match_id', match.id);
+    expect(theirMarks).toEqual([]);
+    const { data: thread } = await opponent
+      .from('match_events')
+      .select('id')
+      .eq('match_id', match.id);
+    expect(thread).toEqual([]);
+
+    // match_result reveals nothing while the game is still in progress.
+    const { data: reveal } = await opponent.rpc('match_result', { p_match_id: match.id });
+    expect(reveal).toEqual([]);
+  });
+
+  test('a player cannot guess when it is not their turn', async () => {
+    const { match, opponent } = await playingMatch();
+    const { error } = await opponent.rpc('guess', {
+      p_match_id: match.id,
+      p_pokemon_id: match.board[0],
+    });
+    expect(error?.message).toContain('not_your_turn');
+  });
+
+  test('a player cannot ask and guess in the same turn (ask XOR guess)', async () => {
+    const { match, guesser, opponentSecret } = await playingMatch();
+    await guesser.rpc('ask_question', { p_match_id: match.id, p_question: 'Fire?' });
+    const { error } = await guesser.rpc('guess', {
+      p_match_id: match.id,
+      p_pokemon_id: opponentSecret,
+    });
+    expect(error?.message).toContain('not_awaiting_question');
+  });
+
+  test('a card off the board cannot be guessed', async () => {
+    const { match, guesser } = await playingMatch();
+    const { error } = await guesser.rpc('guess', { p_match_id: match.id, p_pokemon_id: 999999 });
+    expect(error?.message).toContain('not_on_board');
+  });
+});

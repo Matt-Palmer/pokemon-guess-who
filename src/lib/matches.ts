@@ -145,6 +145,47 @@ export function useMySecret(matchId: string | undefined) {
   return { secret, refetch };
 }
 
+export type MatchResult = {
+  winnerId: string | null;
+  player1Secret: number;
+  player2Secret: number;
+};
+
+/**
+ * The end-of-game reveal: the winner and *both* secrets. Backed by `match_result`,
+ * which only returns rows once the match is `completed` and only to its two
+ * players — so this stays null mid-game and the column-level secret grants are
+ * never loosened. Pass `enabled` (e.g. `status === 'completed'`) so the fetch only
+ * fires when a result exists; both winner and loser resolve the same reveal.
+ */
+export function useMatchResult(matchId: string | undefined, enabled: boolean) {
+  const supabase = useSupabase();
+  const [result, setResult] = useState<MatchResult | null>(null);
+
+  useEffect(() => {
+    if (!matchId || !enabled) return;
+    let cancelled = false;
+
+    supabase.rpc('match_result', { p_match_id: matchId }).then(({ data }) => {
+      const rows = data as
+        | { winner_id: string | null; player1_secret: number; player2_secret: number }[]
+        | null;
+      if (cancelled || !rows || rows.length === 0) return;
+      setResult({
+        winnerId: rows[0].winner_id,
+        player1Secret: rows[0].player1_secret,
+        player2Secret: rows[0].player2_secret,
+      });
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [matchId, enabled, supabase]);
+
+  return result;
+}
+
 const TURN_ERRORS: Record<string, string> = {
   not_your_turn: "It's not your turn.",
   not_awaiting_question: 'A question has already been asked.',
@@ -192,6 +233,35 @@ export async function answerQuestion(
   });
   if (error) throw friendlyTurnError(error.message, 'Could not post that answer.');
   return data as MatchEventRow;
+}
+
+export type GuessResult = {
+  correct: boolean;
+  /** The winner's clerk id on a correct guess; null on a wrong guess. */
+  winnerId: string | null;
+};
+
+/**
+ * Guess the opponent's secret on your turn (offered instead of asking). The
+ * server auto-validates and returns the outcome **only to the caller** — a wrong
+ * guess never carries the opponent's secret back, so nothing leaks. A correct
+ * guess ends the match; a wrong one auto-crosses the missed card on your own
+ * board and passes the turn. Neither path writes the shared thread, so the
+ * opponent is never shown the guess. The end-of-game reveal comes from
+ * {@link useMatchResult} once `status` is `completed`.
+ */
+export async function guess(
+  supabase: SupabaseClient,
+  matchId: string,
+  pokemonId: number,
+): Promise<GuessResult> {
+  const { data, error } = await supabase.rpc('guess', {
+    p_match_id: matchId,
+    p_pokemon_id: pokemonId,
+  });
+  if (error) throw friendlyTurnError(error.message, 'Could not submit that guess.');
+  const row = data as { correct: boolean; winner_id: string | null };
+  return { correct: row.correct, winnerId: row.winner_id };
 }
 
 /**

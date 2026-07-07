@@ -1,4 +1,4 @@
-# Pokémon Guess Who — Handoff (Issue 4 complete: turn loop, verified against live DB)
+# Pokémon Guess Who — Handoff (Issue 5 complete: guessing / win-loss, verified against live DB)
 
 **Project:** `/Users/Matt/Dev/pokemon-guess-who` — Expo/expo-router + Clerk auth + Supabase (Postgres + Realtime).
 Supabase project ref `azaemyxdzapolhqmcwpq`. Issues live in `issues/`, spec in `PRD.md`.
@@ -61,15 +61,34 @@ Supabase project ref `azaemyxdzapolhqmcwpq`. Issues live in `issues/`, spec in `
     "authenticated can execute SECURITY DEFINER" warnings). ⚠️ New integration tests leave `matches` /
     `match_events` / `board_marks` rows for the `rlstest1`/`rlstest2` profiles — clean up per the gotcha below.
 
-## Next steps — Issue 5: guessing / win-loss
+- **Issue 5** (guessing / win-loss — first fully playable game): **complete, applied to the live DB, verified by
+    the integration suite, and smoke-tested on device (guess flow confirms correct/incorrect).**
+  - Reducer: `GUESS` in `src/lib/game/reducer.ts`. Gated exactly like `ASK` (current player, phase
+    `awaiting_question` — you ask **XOR** guess). Correct → `status='completed'` + `winnerId` + `endedAt`.
+    Wrong → auto-crosses the missed card on the **guesser's own** `eliminated` list and passes the turn
+    (phase stays `awaiting_question`). Pure/deterministic; the guessed card only ever touches the guesser's
+    private state.
+  - Migration `00006_guessing_win_loss`: `guess` RPC (mirrors the reducer; reads the opponent's secret under
+    SECURITY DEFINER to auto-validate). **Privacy by construction** — a guess is *never* written to the shared
+    `match_events` thread, the RPC's composite return (`guess_result`) carries the opponent's secret **only on a
+    correct/game-over guess**, and a wrong guess's auto-cross lands only in the guesser's owner-scoped
+    `board_marks`. New `match_result` RPC reveals **both** secrets to **both** players, but only once
+    `status='completed'` — the end-of-game reveal without ever loosening the column-level secret grants.
+  - Client (`src/lib/matches.ts`): `guess()` (+ friendly error map, returns only `{correct, winnerId}` — never
+    the opponent's secret on a wrong guess) and `useMatchResult(id, enabled)` for the reveal.
+  - Match UI (`src/app/match/[id].tsx`): "Make a guess instead" enters a guess mode (banner turns green,
+    tap-to-select a card, Confirm/Cancel bar) distinct from tap-to-cross-off; a wrong guess shows a toast and the
+    turn passes; on completion a win/loss end screen reveals both secrets.
+  - **63/63 tests pass** (32 reducer + 31 integration incl. new GUESS reducer + guess/match_result live-DB
+    blocks: correct-win, wrong-guess auto-cross + turn-pass + privacy, not-your-turn, ask-XOR-guess), `tsc`
+    clean, `npm run lint` clean, security advisors clean (only the by-design SECURITY DEFINER warnings). ⚠️ New
+    integration tests leave `matches` / `board_marks` rows for the `rlstest1`/`rlstest2` profiles — clean up per
+    the gotcha below.
 
-`issues/05-guessing-win-loss.md`. The turn loop is in place (`current_player` / `phase`), so a `GUESS` action
-can hang off the same turn machinery.
+## Next steps — Issue 6: stats on game end
 
-1. Build `GUESS` in the reducer **test-first** — likely turn-gated, correct guess → win, wrong guess →
-   loss/penalty per the issue/PRD. Sets `status='completed'` + `winner_id` + `ended_at`.
-2. Add the DB adapter RPC (mirror the reducer; reveal both secrets on game end as the issue requires).
-3. Wire the match UI: a guess affordance (distinct from cross-off) and a win/loss end state.
+`issues/06-stats-on-game-end.md`. A match now reaches `status='completed'` with `winner_id`/`ended_at` set, so
+per-player stats (games played, wins/losses, win rate, streaks) can hang off that terminal transition.
 
 ## Gotchas for the new session
 

@@ -254,9 +254,79 @@ describe('CROSS_OFF — private board marks', () => {
   });
 });
 
+describe('GUESS — ending the game', () => {
+  // player1's secret is 7, player2's is 12 (see playingMatch). player1 guesses
+  // player2's card, so a correct guess is 12 and any other board card is wrong.
+  test('a correct guess wins the match for the guesser and ends it', () => {
+    const next = reduce(playingMatch('player1'), { type: 'GUESS', player: 'player1', pokemonId: 12 });
+    expect(next.status).toBe('completed');
+    expect(next.winnerId).toBe('user_1'); // player1Id
+    expect(next.endedAt).not.toBeNull();
+  });
+
+  test('player2 guessing player1’s secret wins for player2', () => {
+    // Move the turn to player2 first (player1 asks, player2 answers).
+    let s = reduce(playingMatch('player1'), { type: 'ASK', player: 'player1', question: 'Fire?' });
+    s = reduce(s, { type: 'ANSWER', player: 'player2', answer: 'No' });
+    const next = reduce(s, { type: 'GUESS', player: 'player2', pokemonId: 7 });
+    expect(next.status).toBe('completed');
+    expect(next.winnerId).toBe('user_2'); // player2Id
+  });
+
+  test('a wrong guess auto-crosses the missed card on the guesser’s own board and passes the turn', () => {
+    const next = reduce(playingMatch('player1'), { type: 'GUESS', player: 'player1', pokemonId: 5 });
+    expect(next.status).toBe('active');
+    expect(next.winnerId).toBeNull();
+    expect(next.eliminated.player1).toContain(5);
+    // Turn passes to the opponent, back to the question phase.
+    expect(next.currentPlayer).toBe('player2');
+    expect(next.phase).toBe('awaiting_question');
+  });
+
+  test('a wrong guess never touches the opponent’s state — the guess stays private', () => {
+    const start = playingMatch('player1', { eliminated: { player1: [], player2: [9] } });
+    const next = reduce(start, { type: 'GUESS', player: 'player1', pokemonId: 5 });
+    // The opponent's crossed-off list is untouched; nothing reveals the guess.
+    expect(next.eliminated.player2).toEqual([9]);
+    expect(start.eliminated.player1).toEqual([]); // input not mutated
+  });
+
+  test('a player cannot guess when it is not their turn', () => {
+    expect(() =>
+      reduce(playingMatch('player1'), { type: 'GUESS', player: 'player2', pokemonId: 7 }),
+    ).toThrow(/not your turn/i);
+  });
+
+  test('a player cannot both ask and guess in the same turn — no guess while an answer is pending', () => {
+    const afterAsk = reduce(playingMatch('player1'), {
+      type: 'ASK',
+      player: 'player1',
+      question: 'Fire?',
+    });
+    expect(() =>
+      reduce(afterAsk, { type: 'GUESS', player: 'player1', pokemonId: 12 }),
+    ).toThrow(/turn|awaiting/i);
+  });
+
+  test('a card must be on the board to be guessed', () => {
+    expect(() =>
+      reduce(playingMatch('player1'), { type: 'GUESS', player: 'player1', pokemonId: 999 }),
+    ).toThrow(/not on the board/i);
+  });
+
+  test('guesses can only be made during an active match', () => {
+    expect(() =>
+      reduce(playingMatch('player1', { status: 'completed' }), {
+        type: 'GUESS',
+        player: 'player1',
+        pokemonId: 12,
+      }),
+    ).toThrow(/active/i);
+  });
+});
+
 describe('game reducer skeleton — events not yet implemented', () => {
   const events: MatchEvent[] = [
-    { type: 'GUESS', player: 'player1', pokemonId: 6 },
     { type: 'RESIGN', player: 'player2' },
     { type: 'CLAIM_INACTIVE', player: 'player1' },
   ];

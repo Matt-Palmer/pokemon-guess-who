@@ -17,12 +17,14 @@ import {
   answerQuestion,
   askQuestion,
   drawSecret,
+  guess,
   PokemonCard,
   useBoardMarks,
   useBoardPokemon,
   useMatch,
   useMatchEvents,
   useMatchPlayers,
+  useMatchResult,
   useMySecret,
 } from '@/lib/matches';
 import { useSupabase } from '@/lib/supabase';
@@ -37,12 +39,17 @@ export default function MatchScreen() {
   const events = useMatchEvents(id, match?.last_activity_at);
   const { marks, toggle: toggleMark } = useBoardMarks(id);
   const players = useMatchPlayers(id);
+  const result = useMatchResult(id, match?.status === 'completed');
   const [selected, setSelected] = useState<PokemonCard | null>(null);
   const [drawing, setDrawing] = useState(false);
   const [drawError, setDrawError] = useState<string | null>(null);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
   const [turnError, setTurnError] = useState<string | null>(null);
+  const [guessMode, setGuessMode] = useState(false);
+  const [guessTarget, setGuessTarget] = useState<PokemonCard | null>(null);
+  const [guessing, setGuessing] = useState(false);
+  const [guessFeedback, setGuessFeedback] = useState<string | null>(null);
   const threadRef = useRef<ScrollView>(null);
 
   const mySlot = match ? (match.player1_id === user?.id ? 'player1' : 'player2') : null;
@@ -108,6 +115,47 @@ export default function MatchScreen() {
       await toggleMark(card.id);
     } catch (err: any) {
       setTurnError(err?.message ?? 'Could not update that card.');
+    }
+  };
+
+  // In guess mode a tap picks the card to guess (confirmed separately) rather
+  // than crossing it off, so a guess is never triggered by a stray tap.
+  const onCardPress = (card: PokemonCard) => {
+    if (guessMode) setGuessTarget(card);
+    else onToggleCross(card);
+  };
+
+  const enterGuessMode = () => {
+    setTurnError(null);
+    setGuessFeedback(null);
+    setGuessTarget(null);
+    setGuessMode(true);
+  };
+
+  const cancelGuess = () => {
+    setGuessMode(false);
+    setGuessTarget(null);
+  };
+
+  const onConfirmGuess = async () => {
+    if (!id || !guessTarget || guessing) return;
+    setTurnError(null);
+    setGuessFeedback(null);
+    setGuessing(true);
+    try {
+      const res = await guess(supabase, id, guessTarget.id);
+      // On a correct guess the match flips to `completed` via Realtime and the
+      // end screen takes over. On a wrong guess the server auto-crosses the
+      // missed card (arriving via the board_marks stream) and passes the turn.
+      if (!res.correct) {
+        setGuessFeedback(`Not ${guessTarget.name}. Your turn is over.`);
+      }
+      setGuessTarget(null);
+      setGuessMode(false);
+    } catch (err: any) {
+      setTurnError(err?.message ?? 'Could not submit that guess.');
+    } finally {
+      setGuessing(false);
     }
   };
 
@@ -190,6 +238,48 @@ export default function MatchScreen() {
   };
   const oppName = nameFor(oppSlot, 'your opponent');
 
+  // ── Game over: reveal both secrets to winner and loser alike. ──
+  if (match.status === 'completed') {
+    const didIWin = match.winner_id === user?.id;
+    const oppSecretId = oppSlot === 'player1' ? result?.player1Secret : result?.player2Secret;
+    const mySecretReveal = mySlot === 'player1' ? result?.player1Secret : result?.player2Secret;
+    const oppSecretCard = cards.find((c) => c.id === oppSecretId) ?? null;
+    const mySecretRevealCard = cards.find((c) => c.id === mySecretReveal) ?? null;
+
+    const RevealCard = ({ label, card }: { label: string; card: PokemonCard | null }) => (
+      <View style={styles.revealCol}>
+        <Text style={styles.revealLabel}>{label}</Text>
+        {card ? (
+          <>
+            <Image source={{ uri: card.sprite_url }} style={styles.revealSprite} contentFit="contain" />
+            <Text style={styles.revealName}>{card.name}</Text>
+          </>
+        ) : (
+          <ActivityIndicator color={colors.primary} />
+        )}
+      </View>
+    );
+
+    return (
+      <View style={styles.container}>
+        <View style={styles.endPanel}>
+          <Text style={[styles.endTitle, didIWin ? styles.endWin : styles.endLose]}>
+            {didIWin ? 'You won! 🎉' : 'You lost'}
+          </Text>
+          <Text style={styles.endSubtitle}>
+            {didIWin
+              ? `You guessed ${oppName}'s secret.`
+              : `${oppName} guessed your secret.`}
+          </Text>
+          <View style={styles.revealRow}>
+            <RevealCard label={`${oppName}'s secret`} card={oppSecretCard} />
+            <RevealCard label="Your secret" card={mySecretRevealCard} />
+          </View>
+        </View>
+      </View>
+    );
+  }
+
   const isMyTurn = match.current_player === mySlot;
   const iAsk = match.phase === 'awaiting_question' && isMyTurn;
   // The answerer is the opponent of the asker (current_player).
@@ -206,19 +296,30 @@ export default function MatchScreen() {
 
   return (
     <View style={styles.container}>
-      <View style={styles.turnBanner}>
-        <Text style={styles.turnText}>{banner}</Text>
-        <Text style={styles.turnHint}>Tap a card to cross it off · long-press for details</Text>
+      <View style={[styles.turnBanner, guessMode && styles.turnBannerGuess]}>
+        <Text style={styles.turnText}>
+          {guessMode ? 'Tap the card you think is their secret' : banner}
+        </Text>
+        <Text style={styles.turnHint}>
+          {guessMode
+            ? 'A wrong guess costs you your turn · long-press for details'
+            : 'Tap a card to cross it off · long-press for details'}
+        </Text>
       </View>
 
       <ScrollView style={styles.board} contentContainerStyle={styles.grid}>
         {cards.map((card) => {
           const crossed = marks.has(card.id);
+          const isGuessTarget = guessTarget?.id === card.id;
           return (
             <Pressable
               key={card.id}
-              style={[styles.card, card.id === mySecretId && styles.cardMine]}
-              onPress={() => onToggleCross(card)}
+              style={[
+                styles.card,
+                card.id === mySecretId && styles.cardMine,
+                isGuessTarget && styles.cardGuessTarget,
+              ]}
+              onPress={() => onCardPress(card)}
               onLongPress={() => setSelected(card)}>
               <Image
                 source={{ uri: card.sprite_url }}
@@ -267,49 +368,79 @@ export default function MatchScreen() {
         </ScrollView>
 
         {turnError && <Text style={styles.error}>{turnError}</Text>}
+        {guessFeedback && <Text style={styles.guessFeedback}>{guessFeedback}</Text>}
 
-        {iAnswer && (
-          <View style={styles.quickRow}>
-            <Pressable
-              style={[styles.quickBtn, sending && styles.sendBtnDisabled]}
-              disabled={sending}
-              onPress={() => sendAnswer('Yes')}>
-              <Text style={styles.quickText}>Yes</Text>
+        {guessMode ? (
+          // Guess controls take over the input area while a guess is being made.
+          <View style={styles.guessBar}>
+            <Pressable style={styles.guessCancelBtn} disabled={guessing} onPress={cancelGuess}>
+              <Text style={styles.guessCancelText}>Cancel</Text>
             </Pressable>
             <Pressable
-              style={[styles.quickBtn, sending && styles.sendBtnDisabled]}
-              disabled={sending}
-              onPress={() => sendAnswer('No')}>
-              <Text style={styles.quickText}>No</Text>
-            </Pressable>
-          </View>
-        )}
-
-        {iAsk || iAnswer ? (
-          <View style={styles.inputRow}>
-            <TextInput
-              style={styles.input}
-              value={input}
-              onChangeText={setInput}
-              placeholder={iAsk ? 'Ask a yes/no question…' : 'Type your answer…'}
-              placeholderTextColor={colors.textMuted}
-              editable={!sending}
-              onSubmitEditing={onSend}
-              returnKeyType="send"
-            />
-            <Pressable
-              style={[styles.sendBtn, (sending || !input.trim()) && styles.sendBtnDisabled]}
-              disabled={sending || !input.trim()}
-              onPress={onSend}>
-              <Text style={styles.sendText}>Send</Text>
+              style={[
+                styles.guessConfirmBtn,
+                (guessing || !guessTarget) && styles.sendBtnDisabled,
+              ]}
+              disabled={guessing || !guessTarget}
+              onPress={onConfirmGuess}>
+              <Text style={styles.sendText}>
+                {guessTarget ? `Guess ${guessTarget.name}` : 'Pick a card'}
+              </Text>
             </Pressable>
           </View>
         ) : (
-          <Text style={styles.waitingHint}>
-            {match.phase === 'awaiting_answer'
-              ? `Waiting for ${oppName} to answer…`
-              : `Waiting for ${oppName}…`}
-          </Text>
+          <>
+            {iAnswer && (
+              <View style={styles.quickRow}>
+                <Pressable
+                  style={[styles.quickBtn, sending && styles.sendBtnDisabled]}
+                  disabled={sending}
+                  onPress={() => sendAnswer('Yes')}>
+                  <Text style={styles.quickText}>Yes</Text>
+                </Pressable>
+                <Pressable
+                  style={[styles.quickBtn, sending && styles.sendBtnDisabled]}
+                  disabled={sending}
+                  onPress={() => sendAnswer('No')}>
+                  <Text style={styles.quickText}>No</Text>
+                </Pressable>
+              </View>
+            )}
+
+            {iAsk || iAnswer ? (
+              <View style={styles.inputRow}>
+                <TextInput
+                  style={styles.input}
+                  value={input}
+                  onChangeText={setInput}
+                  placeholder={iAsk ? 'Ask a yes/no question…' : 'Type your answer…'}
+                  placeholderTextColor={colors.textMuted}
+                  editable={!sending}
+                  onSubmitEditing={onSend}
+                  returnKeyType="send"
+                />
+                <Pressable
+                  style={[styles.sendBtn, (sending || !input.trim()) && styles.sendBtnDisabled]}
+                  disabled={sending || !input.trim()}
+                  onPress={onSend}>
+                  <Text style={styles.sendText}>Send</Text>
+                </Pressable>
+              </View>
+            ) : (
+              <Text style={styles.waitingHint}>
+                {match.phase === 'awaiting_answer'
+                  ? `Waiting for ${oppName} to answer…`
+                  : `Waiting for ${oppName}…`}
+              </Text>
+            )}
+
+            {/* On your turn you may ask a question XOR make a guess. */}
+            {iAsk && (
+              <Pressable style={styles.guessStartBtn} onPress={enterGuessMode}>
+                <Text style={styles.guessStartText}>Make a guess instead</Text>
+              </Pressable>
+            )}
+          </>
         )}
       </View>
 
@@ -371,6 +502,7 @@ const styles = StyleSheet.create({
     padding: 4,
   },
   cardMine: { borderColor: colors.accent, borderWidth: 2.5 },
+  cardGuessTarget: { borderColor: colors.correct, borderWidth: 3, backgroundColor: colors.correctBg },
   sprite: { width: '100%', height: '70%' },
   spriteCrossed: { opacity: 0.2 },
   name: { fontSize: 10, fontWeight: '600', color: colors.text, textTransform: 'capitalize' },
@@ -388,8 +520,67 @@ const styles = StyleSheet.create({
     borderBottomColor: colors.border,
     alignItems: 'center',
   },
+  turnBannerGuess: { backgroundColor: colors.correctBg, borderBottomColor: colors.correct },
   turnText: { fontSize: 16, fontWeight: '800', color: colors.text },
   turnHint: { fontSize: 11, color: colors.textMuted, marginTop: 2 },
+
+  // Guessing
+  guessFeedback: {
+    color: colors.wrong,
+    backgroundColor: colors.wrongBg,
+    fontWeight: '700',
+    textAlign: 'center',
+    paddingVertical: 8,
+    borderRadius: 10,
+    marginBottom: 8,
+    overflow: 'hidden',
+  },
+  guessStartBtn: {
+    marginTop: 10,
+    paddingVertical: 11,
+    borderRadius: 10,
+    borderWidth: 1.5,
+    borderColor: colors.correct,
+    backgroundColor: colors.correctBg,
+    alignItems: 'center',
+  },
+  guessStartText: { color: colors.correct, fontWeight: '800', fontSize: 15 },
+  guessBar: { flexDirection: 'row', gap: 8, alignItems: 'center', marginTop: 4 },
+  guessCancelBtn: {
+    paddingHorizontal: 18,
+    paddingVertical: 12,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  guessCancelText: { color: colors.text, fontWeight: '700' },
+  guessConfirmBtn: {
+    flex: 1,
+    paddingVertical: 12,
+    borderRadius: 10,
+    backgroundColor: colors.correct,
+    alignItems: 'center',
+  },
+
+  // End screen
+  endPanel: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 24 },
+  endTitle: { fontSize: 32, fontWeight: '900', marginBottom: 8 },
+  endWin: { color: colors.correct },
+  endLose: { color: colors.wrong },
+  endSubtitle: { fontSize: 15, color: colors.textMuted, textAlign: 'center', marginBottom: 28 },
+  revealRow: { flexDirection: 'row', gap: 20 },
+  revealCol: {
+    alignItems: 'center',
+    backgroundColor: colors.card,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: colors.border,
+    padding: 16,
+    minWidth: 130,
+  },
+  revealLabel: { fontSize: 12, color: colors.textMuted, fontWeight: '700', marginBottom: 8 },
+  revealSprite: { width: 88, height: 88 },
+  revealName: { fontSize: 16, fontWeight: '700', color: colors.text, textTransform: 'capitalize', marginTop: 4 },
 
   // Q/A thread + input
   threadPanel: {
