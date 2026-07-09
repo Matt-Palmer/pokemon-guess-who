@@ -16,5 +16,12 @@
     "**/*.tsx",
     ".expo/types/**/*.ts",
     "expo-env.d.ts"
+  ],
+  // The Edge Function entrypoint is Deno code (Deno.serve, npm:/jsr: imports),
+  // type-checked by the Deno toolchain on deploy rather than this tsc. Its pure
+  // logic (derive.ts) stays included and jest-tested.
+  "exclude": [
+    "node_modules",
+    "supabase/functions/push/index.ts"
   ]
 }

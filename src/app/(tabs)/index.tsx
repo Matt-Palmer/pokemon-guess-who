@@ -6,6 +6,7 @@ import { ActivityIndicator, FlatList, Pressable, StyleSheet, Text, View } from '
 import { colors } from '@/constants/colors';
 import { summarizeTurn, TurnKind } from '@/lib/game/summary';
 import { MyMatchRow, useMyMatches, useOnlinePlayers } from '@/lib/matches';
+import { usePushRegistration } from '@/lib/notifications';
 import { useProfile } from '@/lib/profile';
 
 /** Copy for each turn state; `opponent` is the display name (never null once needed). */
@@ -40,6 +41,10 @@ export default function GamesScreen() {
   const { matches, loading, error, refetch } = useMyMatches();
   const online = useOnlinePlayers(user?.id);
   const router = useRouter();
+
+  // Home is the first signed-in screen and useProfile guarantees the row
+  // exists, so this is where the install registers its push token.
+  usePushRegistration(profile);
 
   // The tab stays mounted while playing; re-read the list whenever it regains
   // focus so finished/advanced games are reflected even if a Realtime refetch

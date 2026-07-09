@@ -89,4 +89,34 @@ function clientFor(jwt: string) {
       .single();
     expect(unchanged?.username).toBe('rlstest1');
   });
+
+  test('a user can store their own expo push token (the registration write path)', async () => {
+    const token = `ExponentPushToken[rlstest-${Date.now()}]`;
+    const { error } = await clientA
+      .from('profiles')
+      .update({ expo_push_token: token })
+      .eq('clerk_id', CLERK_TEST_USER_1);
+    expect(error).toBeNull();
+
+    const { data } = await clientA
+      .from('profiles')
+      .select('expo_push_token')
+      .eq('clerk_id', CLERK_TEST_USER_1)
+      .single();
+    expect(data?.expo_push_token).toBe(token);
+
+    // Leave no stale token behind: rlstest users must never receive real pushes.
+    await clientA.from('profiles').update({ expo_push_token: null }).eq('clerk_id', CLERK_TEST_USER_1);
+  });
+
+  test('clients cannot read the push webhook secret', async () => {
+    // The secret authenticates the DB→Edge Function webhook; only service_role
+    // may execute the RPC that reveals it.
+    const { error: authedError } = await clientA.rpc('get_push_webhook_secret');
+    expect(authedError?.message).toMatch(/permission denied/);
+
+    const anonClient = createClient(SUPABASE_URL!, SUPABASE_ANON_KEY!);
+    const { error: anonError } = await anonClient.rpc('get_push_webhook_secret');
+    expect(anonError?.message).toMatch(/permission denied/);
+  });
 });

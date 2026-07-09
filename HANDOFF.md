@@ -1,4 +1,4 @@
-# Pokémon Guess Who — Handoff (Issue 8 complete: async & multiple games)
+# Pokémon Guess Who — Handoff (Issue 9 complete: push notifications)
 
 **Project:** `/Users/Matt/Dev/pokemon-guess-who` — Expo/expo-router + Clerk auth + Supabase (Postgres + Realtime).
 Supabase project ref `azaemyxdzapolhqmcwpq`. Issues live in `issues/`, spec in `PRD.md`.
@@ -84,16 +84,66 @@ Supabase project ref `azaemyxdzapolhqmcwpq`. Issues live in `issues/`, spec in `
     match row/secret/thread/marks via a **fresh client**), `tsc` clean, lint clean, advisors clean (only the
     by-design SECURITY DEFINER WARNs; `my_matches` joins that list). Not yet smoke-tested on device.
 
-## Next steps — Issue 9: push notifications
+- **Issue 9** (push notifications): server-side push, deployed live and verified end-to-end on the wire.
+  - **Pure derivation** `supabase/functions/push/derive.ts`: `deriveNotifications(old, new, names)` maps a
+    `matches`-row transition to messages — party_joined → host; your_turn → player the move passed to (p2's
+    draw turn, coin-flipped first player, wrong-guess turn pass — copy deliberately neutral so it never leaks
+    that a guess happened; an answerer's self-created turn is NOT notified); answer_needed → asker's opponent;
+    game_ended → both players with win/loss copy; claim_available → the waiting player (via `playerToMove`,
+    draw-phase aware). Plus `toExpoMessages` (token attach, tokenless recipients dropped). 13 unit tests in
+    `derive.test.ts` cover recipient/token/payload per event type, incl. "chat stays silent".
+  - **Edge Function `push`** (`supabase/functions/push/index.ts`, deployed via MCP, `verify_jwt=false`): checks
+    the `x-push-secret` header against a Vault secret read through the service-role-only
+    `get_push_webhook_secret` RPC (401 otherwise — curl-verified), pre-derives to skip no-op updates, fetches
+    both players' `username`/`expo_push_token` with the service role, sends via the Expo push API.
+    `index.ts` is excluded from tsconfig (Deno globals); `derive.ts` stays tsc- and jest-covered.
+  - **Migrations `00009_push_notifications` + `00010_push_notifications_hardening`:** `matches_notify_push`
+    AFTER UPDATE trigger posts secret-stripped old/new rows to the function via `net.http_post` (async — game
+    writes never block on push); webhook secret minted randomly straight into Vault (never in the repo);
+    `claim_notified` column (not client-readable) + hourly pg_cron scan (`notify-claimable-matches`, :17) flags
+    active matches idle 7+ days + BEFORE-UPDATE reset trigger re-arms it on real activity (keyed on
+    `last_activity_at`, which the cron flag-set never touches). 00010: pg_net recreated under `extensions`
+    (not relocatable → drop/create), `reset_claim_notified` search_path pinned.
+  - **Client:** `src/lib/notifications.ts` — `usePushRegistration(profile)` (wired in the home screen; stores
+    the Expo token on `profiles.expo_push_token`, skips unchanged, silently no-ops on simulator / Expo Go / no
+    EAS projectId / permission denied) and `useNotificationDeepLink` (root layout via `NotificationDeepLinker`;
+    routes tapped notifications' `data.url` to `/lobby/[id]` or `/match/[id]`, waits for Clerk on cold start,
+    handles each response once). Foreground presentation suppressed (`setNotificationHandler`) per the PRD's
+    "when backgrounded" — also what makes game_ended's send-to-both correct. `expo-notifications`/`expo-device`
+    installed; `expo-notifications` plugin added to app.json.
+  - **114/114 tests pass** (13 derive + 2 new integration: client can write own `expo_push_token`,
+    `get_push_webhook_secret` denied to authenticated+anon), `tsc` clean, lint clean, advisors clean (only the
+    by-design SECURITY DEFINER WARNs). End-to-end verified: the integration run's live `matches` updates fired
+    103 webhook deliveries, all 200 — 74 derived 1 notification, 3 derived 2 (game end → both), 26 correctly
+    derived 0; sends were 0 because test profiles hold no tokens (by design — see gotchas).
 
-`issues/09-push-notifications.md`. Server-side push via a Supabase Edge Function triggered by DB webhooks:
-register for Expo push in the app and store the token on `profiles.expo_push_token` (column + client grant
-already exist), then notify on turn/answer-needed, game-ended, party-joined, and claim-available — never for
-chat messages. Tapping a notification deep-links to the game. Edge Functions deploy via the Supabase MCP
-(`deploy_edge_function`); note DB webhooks will need configuring, and the Edge Function must pick the correct
-recipient per event type (tests required for that selection logic).
+## Next steps — Issue 10: resign & 7-day inactivity claim
+
+`issues/10-resign-inactivity-claim.md`. Reducer `RESIGN` + `CLAIM_INACTIVE` events; resign RPC = immediate
+forfeit (opponent wins), claim RPC eligible when the opponent hasn't moved for 7 days; both end the game by
+flipping `status='completed'` + `winner_id` — the stats trigger (00007) and game-ended push (00009) then fire
+for free. Client: resign button, claim option + visible countdown (derive from `last_activity_at`; the
+`claim_notified` column is server-only). Note game_ended push copy currently says "won this one — rematch?"
+for the loser; consider an `ended_reason` if resign should read differently.
 
 ## Gotchas for the new session
+
+- **Real device pushes need an EAS projectId + dev build.** `getExpoPushTokenAsync` requires
+  `extra.eas.projectId` in app.json (not yet configured — run `eas init`), and Expo Go dropped remote-push
+  support in SDK 53, so a development build is required. Until then `usePushRegistration` silently no-ops
+  (token stays null, server drops the recipient). The whole server pipeline is already live and verified.
+- **Never store a real push token on the `rlstest1`/`rlstest2` profiles** — integration tests drive live
+  matches through the webhook, and any stored token would receive a flood of real notifications. The
+  registration test writes a fake token and nulls it afterwards.
+- **Webhook debugging:** delivery results (status + the function's JSON response, e.g. `{"sent":0,"derived":1}`)
+  land in `net._http_response`; function-side logs via MCP `get_logs` (service `edge-function`). The trigger is
+  fire-and-forget — a down Edge Function never breaks game writes.
+- **The push webhook secret lives only in Vault** (`push_webhook_secret`, minted randomly by 00009 — not in the
+  repo). The Edge Function reads it via `get_push_webhook_secret` (service_role-only). If it's ever rotated,
+  note the function caches it per instance.
+- **`matches.claim_notified` is server-only** (not in the client column grant, `MATCH_COLUMNS`, or
+  `my_matches`). Issue 10's countdown must derive from `last_activity_at`. The pg_cron job
+  `notify-claimable-matches` runs hourly at :17.
 
 - **Realtime subscriptions:** use `useRealtimeAuth(supabase)` — `await authNow()` before `.subscribe()` (race-free
   join) **and** it keeps the socket's token refreshed. Passing an explicit token to `setAuth` before subscribe is
