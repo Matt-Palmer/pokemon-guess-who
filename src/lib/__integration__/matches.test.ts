@@ -555,3 +555,141 @@ function clientFor(jwt: string) {
     expect(error?.message).toContain('not_on_board');
   });
 });
+
+(hasLiveConfig ? describe : describe.skip)('stats on game end', () => {
+  let host: SupabaseClient;
+  let joiner: SupabaseClient;
+
+  beforeAll(async () => {
+    const [jwtA, jwtB] = await Promise.all([
+      mintSessionToken(CLERK_TEST_USER_1!),
+      mintSessionToken(CLERK_TEST_USER_2!),
+    ]);
+    host = clientFor(jwtA);
+    joiner = clientFor(jwtB);
+    await host.from('profiles').upsert({ clerk_id: CLERK_TEST_USER_1, username: 'rlstest1' });
+    await joiner.from('profiles').upsert({ clerk_id: CLERK_TEST_USER_2, username: 'rlstest2' });
+  });
+
+  type StatsRow = {
+    games_played: number;
+    wins: number;
+    losses: number;
+    current_streak: number;
+    best_streak: number;
+  };
+
+  /** Each client can only read its own profile row (RLS), so no id filter needed. */
+  async function statsFor(client: SupabaseClient): Promise<StatsRow> {
+    const { data, error } = await client
+      .from('profiles')
+      .select('games_played, wins, losses, current_streak, best_streak')
+      .single();
+    expect(error).toBeNull();
+    return data as StatsRow;
+  }
+
+  /** Drive a match to active play; resolve the coin flip into guesser/opponent. */
+  async function playingMatch() {
+    const { data: party } = await host.rpc('create_party');
+    await joiner.rpc('join_party', { p_code: party.party_code });
+    const { data: started } = await host.rpc('start_match', { p_match_id: party.id });
+    await host.rpc('draw_secret', { p_match_id: started.id, p_pokemon_id: started.board[0] });
+    await joiner.rpc('draw_secret', { p_match_id: started.id, p_pokemon_id: started.board[1] });
+    const { data: row } = await host
+      .from('matches')
+      .select('current_player')
+      .eq('id', started.id)
+      .single();
+    const currentIsP1 = row!.current_player === 'player1';
+    const guesser = currentIsP1 ? host : joiner;
+    const opponent = currentIsP1 ? joiner : host;
+    const opponentSecret = currentIsP1 ? started.board[1] : started.board[0];
+    const wrongCard = (started.board as number[]).find((c) => c !== opponentSecret)!;
+    return { match: started, guesser, opponent, opponentSecret, wrongCard };
+  }
+
+  test('a completed game updates the winner and loser atomically', async () => {
+    const { match, guesser, opponent, opponentSecret } = await playingMatch();
+    const winnerBefore = await statsFor(guesser);
+    const loserBefore = await statsFor(opponent);
+
+    const { error } = await guesser.rpc('guess', { p_match_id: match.id, p_pokemon_id: opponentSecret });
+    expect(error).toBeNull();
+
+    // Both records reflect the game the moment the game-ending RPC returns —
+    // the trigger runs in the same transaction as the status flip.
+    const winnerAfter = await statsFor(guesser);
+    expect(winnerAfter.games_played).toBe(winnerBefore.games_played + 1);
+    expect(winnerAfter.wins).toBe(winnerBefore.wins + 1);
+    expect(winnerAfter.losses).toBe(winnerBefore.losses);
+    expect(winnerAfter.current_streak).toBe(winnerBefore.current_streak + 1);
+    expect(winnerAfter.best_streak).toBe(
+      Math.max(winnerBefore.best_streak, winnerBefore.current_streak + 1),
+    );
+
+    const loserAfter = await statsFor(opponent);
+    expect(loserAfter.games_played).toBe(loserBefore.games_played + 1);
+    expect(loserAfter.losses).toBe(loserBefore.losses + 1);
+    expect(loserAfter.wins).toBe(loserBefore.wins);
+    expect(loserAfter.current_streak).toBe(0);
+    expect(loserAfter.best_streak).toBe(loserBefore.best_streak);
+  });
+
+  test('a wrong guess leaves both records untouched — only game end counts', async () => {
+    const { match, guesser, opponent, wrongCard } = await playingMatch();
+    const guesserBefore = await statsFor(guesser);
+    const opponentBefore = await statsFor(opponent);
+
+    const { error } = await guesser.rpc('guess', { p_match_id: match.id, p_pokemon_id: wrongCard });
+    expect(error).toBeNull();
+
+    expect(await statsFor(guesser)).toEqual(guesserBefore);
+    expect(await statsFor(opponent)).toEqual(opponentBefore);
+  });
+
+  test('stat counters are not client-writable (column-level privileges)', async () => {
+    const { error } = await host
+      .from('profiles')
+      .update({ wins: 9999 })
+      .eq('clerk_id', CLERK_TEST_USER_1!);
+    expect(error?.message).toMatch(/permission denied/i);
+
+    // Identity columns stay editable — only the counters are locked down.
+    const { error: usernameError } = await host
+      .from('profiles')
+      .update({ username: 'rlstest1' })
+      .eq('clerk_id', CLERK_TEST_USER_1!);
+    expect(usernameError).toBeNull();
+  });
+
+  test('counters are recomputable from the matches history of record', async () => {
+    const { data: recomputed, error } = await host.rpc('recompute_my_stats');
+    expect(error).toBeNull();
+
+    // Replay the caller's readable completed-match history client-side and
+    // check the order-independent aggregates agree with the rebuild.
+    const { data: history } = await host
+      .from('matches')
+      .select('winner_id')
+      .eq('status', 'completed')
+      .not('winner_id', 'is', null);
+    const games = history!.length;
+    const wins = history!.filter((m) => m.winner_id === CLERK_TEST_USER_1).length;
+
+    expect(recomputed.games_played).toBe(games);
+    expect(recomputed.wins).toBe(wins);
+    expect(recomputed.losses).toBe(games - wins);
+    expect(recomputed.wins + recomputed.losses).toBe(recomputed.games_played);
+    expect(recomputed.best_streak).toBeGreaterThanOrEqual(recomputed.current_streak);
+
+    // The rebuild is persisted on the profile row itself.
+    expect(await statsFor(host)).toEqual({
+      games_played: recomputed.games_played,
+      wins: recomputed.wins,
+      losses: recomputed.losses,
+      current_streak: recomputed.current_streak,
+      best_streak: recomputed.best_streak,
+    });
+  });
+});

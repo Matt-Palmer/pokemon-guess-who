@@ -1,12 +1,23 @@
 import { useAuth } from '@clerk/clerk-expo';
+import { useFocusEffect } from 'expo-router';
+import { useCallback } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { colors } from '@/constants/colors';
+import { winRatePercent } from '@/lib/game/stats';
 import { useProfile } from '@/lib/profile';
 
 export default function ProfileScreen() {
   const { signOut } = useAuth();
-  const { profile, loading, error } = useProfile();
+  const { profile, loading, error, refetch } = useProfile();
+
+  // Stats are written server-side when a game ends; re-read them whenever the
+  // tab regains focus so the record reflects games completed this session.
+  useFocusEffect(
+    useCallback(() => {
+      refetch();
+    }, [refetch]),
+  );
 
   if (loading) {
     return (
@@ -24,7 +35,7 @@ export default function ProfileScreen() {
     );
   }
 
-  const winRate = profile.games_played > 0 ? Math.round((profile.wins / profile.games_played) * 100) : 0;
+  const winRate = winRatePercent(profile.wins, profile.games_played);
 
   return (
     <View style={styles.container}>
