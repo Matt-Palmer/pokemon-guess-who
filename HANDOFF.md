@@ -1,4 +1,4 @@
-# Pokémon Guess Who — Handoff (Issue 9 complete: push notifications)
+# Pokémon Guess Who — Handoff (Issue 10 complete: resign & inactivity claim)
 
 **Project:** `/Users/Matt/Dev/pokemon-guess-who` — Expo/expo-router + Clerk auth + Supabase (Postgres + Realtime).
 Supabase project ref `azaemyxdzapolhqmcwpq`. Issues live in `issues/`, spec in `PRD.md`.
@@ -117,14 +117,49 @@ Supabase project ref `azaemyxdzapolhqmcwpq`. Issues live in `issues/`, spec in `
     103 webhook deliveries, all 200 — 74 derived 1 notification, 3 derived 2 (game end → both), 26 correctly
     derived 0; sends were 0 because test profiles hold no tokens (by design — see gotchas).
 
-## Next steps — Issue 10: resign & 7-day inactivity claim
+- **Issue 10** (resign & 7-day inactivity claim): applied to the live DB, Edge Function redeployed (v2),
+  verified by the integration suite + a live backdated-claim E2E.
+  - **Reducer:** `RESIGN` (immediate forfeit — opponent wins; active-only, draw phase included, never
+    turn-gated) and `CLAIM_INACTIVE` (valid only when the *opponent* holds the move per the exported
+    `playerToMove` — draw-order aware, answerer during `awaiting_answer` — and `lastActivityAt` is
+    `CLAIM_WINDOW_MS` = 7 days stale; time is an event input `now` so the rule stays deterministic). Both end
+    the game like a correct guess. New `MatchState.endedReason: 'guess' | 'resign' | 'claim_inactive' | null`
+    (guess sets it too). 11 new reducer tests.
+  - **Migration `00011_resign_inactivity_claim`:** `matches.ended_reason` column (checked, client-granted —
+    the column-explicit SELECT means new columns need their own grant) + backfill of past completions as
+    'guess'; `resign(p_match_id)` and `claim_inactive_win(p_match_id)` SECURITY DEFINER RPCs mirroring the
+    reducer (`your_move` / `too_early` / `match_not_active` / `not_a_player` error codes); `guess` recreated to
+    stamp `ended_reason='guess'`; `my_matches` dropped + recreated to mirror the new column set. Stats trigger
+    (00007) and game-ended push (00009) fire for free on the shared status edge — integration-verified.
+  - **Push:** `derive.ts` `MatchWebhookRow` gained `ended_reason`; game_ended copy is now phrased per reason
+    (resign: "X resigned — the win is yours." / "You resigned…"; claim: "You claimed…" / "X claimed the win
+    after 7 days without a move."). 2 new derive tests; `push` Edge Function redeployed (v2) via MCP.
+  - **Client:** `src/lib/game/claim.ts` — pure `claimState(match, myId, nowMs)` (`not_applicable` when it's
+    your move or the game isn't active; else `countdown {remainingMs}` / `claimable`, built on `summarizeTurn`)
+    + `formatRemaining` ("6d 23h"); 7 unit tests. `matches.ts`: `resign()` / `claimInactiveWin()` wrappers,
+    `ended_reason` in `MatchRow`/`MATCH_COLUMNS`, and `useMatch` now returns `refetch` — resign/claim refetch on
+    success so the actor's own end screen never depends on the realtime round-trip. Match screen: Resign button
+    (Alert-confirmed, destructive) in the turn banner and on the draw screen; while waiting on the opponent a
+    countdown line ("You can claim the win in 6d 23h", 30s tick) that becomes a confirm-gated "claim the win"
+    button; end screen subtitle + push copy phrased by `ended_reason`; reveal cards show "Never drawn" for
+    games resigned during the blind draw.
+  - **141/141 tests pass** (43 reducer + 7 claim + 15 derive + 7 new integration: resign E2E with atomic stat
+    deltas for both players + `ended_reason` readable, either seat can resign, resign during draw, double-resign
+    rejected, fresh-game claims rejected `too_early`/`your_move` leaving the game active, anon denied,
+    unknown match id). Claim *success* isn't jest-reachable (no service key in test env to backdate), so it was
+    verified live once: real match staged via Clerk test users, `last_activity_at` backdated 8 days via MCP
+    `execute_sql`, waiting player's `claim_inactive_win` → completed/`claim_inactive`/stats +1W — and the
+    webhook derived 2 game_ended messages (all 200s). `tsc` clean, lint clean, advisors clean (only the
+    by-design SECURITY DEFINER WARNs; `resign`/`claim_inactive_win` join that list). Not yet smoke-tested on
+    device.
 
-`issues/10-resign-inactivity-claim.md`. Reducer `RESIGN` + `CLAIM_INACTIVE` events; resign RPC = immediate
-forfeit (opponent wins), claim RPC eligible when the opponent hasn't moved for 7 days; both end the game by
-flipping `status='completed'` + `winner_id` — the stats trigger (00007) and game-ended push (00009) then fire
-for free. Client: resign button, claim option + visible countdown (derive from `last_activity_at`; the
-`claim_notified` column is server-only). Note game_ended push copy currently says "won this one — rematch?"
-for the loser; consider an `ended_reason` if resign should read differently.
+## Next steps — Issue 11: random matchmaking
+
+`issues/11-random-matchmaking.md`. A `matchmaking_queue` table + atomic pairing RPC (row locking so two
+players never grab the same opponent — the concurrency safety is the acceptance criterion to prove), enqueue
+via "Find a random game", a Searching screen with working Cancel (dequeue), and an "Opponent found: [username]"
+confirmation before dropping both players into the standard board/draw/play flow (`mode='random'` already
+exists on `matches`). Integration tests should hammer the pairing RPC concurrently.
 
 ## Gotchas for the new session
 

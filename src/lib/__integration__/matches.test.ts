@@ -828,3 +828,137 @@ function clientFor(jwt: string) {
     expect(new Set(marks!.map((r) => r.pokemon_id))).toEqual(new Set([m.board[2], m.board[3]]));
   });
 });
+
+(hasLiveConfig ? describe : describe.skip)('resign & 7-day inactivity claim (issue 10)', () => {
+  let host: SupabaseClient;
+  let joiner: SupabaseClient;
+
+  beforeAll(async () => {
+    const [jwtA, jwtB] = await Promise.all([
+      mintSessionToken(CLERK_TEST_USER_1!),
+      mintSessionToken(CLERK_TEST_USER_2!),
+    ]);
+    host = clientFor(jwtA);
+    joiner = clientFor(jwtB);
+    await host.from('profiles').upsert({ clerk_id: CLERK_TEST_USER_1, username: 'rlstest1' });
+    await joiner.from('profiles').upsert({ clerk_id: CLERK_TEST_USER_2, username: 'rlstest2' });
+  });
+
+  type StatsRow = { games_played: number; wins: number; losses: number };
+
+  async function statsFor(client: SupabaseClient): Promise<StatsRow> {
+    const { data } = await client.from('profiles').select('games_played, wins, losses').single();
+    return data as StatsRow;
+  }
+
+  /** Create → join → start (host is player1); optionally draw both secrets. */
+  async function startedMatch(draw = true) {
+    const { data: party } = await host.rpc('create_party');
+    await joiner.rpc('join_party', { p_code: party.party_code });
+    const { data: started } = await host.rpc('start_match', { p_match_id: party.id });
+    if (draw) {
+      await host.rpc('draw_secret', { p_match_id: started.id, p_pokemon_id: started.board[0] });
+      await joiner.rpc('draw_secret', { p_match_id: started.id, p_pokemon_id: started.board[1] });
+    }
+    return started;
+  }
+
+  test('resigning forfeits: the opponent wins, stats update, ended_reason records it', async () => {
+    const match = await startedMatch();
+    const resignerBefore = await statsFor(host);
+    const winnerBefore = await statsFor(joiner);
+
+    const { error } = await host.rpc('resign', { p_match_id: match.id });
+    expect(error).toBeNull();
+
+    // The row ends exactly like a guessed win, with the reason recorded and
+    // readable by the clients (column-granted).
+    const { data: row } = await joiner
+      .from('matches')
+      .select('status, winner_id, ended_reason, ended_at')
+      .eq('id', match.id)
+      .single();
+    expect(row?.status).toBe('completed');
+    expect(row?.winner_id).toBe(CLERK_TEST_USER_2);
+    expect(row?.ended_reason).toBe('resign');
+    expect(row?.ended_at).not.toBeNull();
+
+    // The stats trigger fires on the same status edge: loss for the resigner,
+    // win for the opponent.
+    const resignerAfter = await statsFor(host);
+    const winnerAfter = await statsFor(joiner);
+    expect(resignerAfter.games_played).toBe(resignerBefore.games_played + 1);
+    expect(resignerAfter.losses).toBe(resignerBefore.losses + 1);
+    expect(resignerAfter.wins).toBe(resignerBefore.wins);
+    expect(winnerAfter.games_played).toBe(winnerBefore.games_played + 1);
+    expect(winnerAfter.wins).toBe(winnerBefore.wins + 1);
+    expect(winnerAfter.losses).toBe(winnerBefore.losses);
+  });
+
+  test('either player may resign — the joiner forfeits to the host', async () => {
+    const match = await startedMatch();
+    const { error } = await joiner.rpc('resign', { p_match_id: match.id });
+    expect(error).toBeNull();
+
+    const { data: row } = await host.from('matches').select('winner_id').eq('id', match.id).single();
+    expect(row?.winner_id).toBe(CLERK_TEST_USER_1);
+  });
+
+  test('a match can be resigned during the blind draw', async () => {
+    const match = await startedMatch(false);
+    const { error } = await host.rpc('resign', { p_match_id: match.id });
+    expect(error).toBeNull();
+
+    const { data: row } = await host
+      .from('matches')
+      .select('status, winner_id, ended_reason')
+      .eq('id', match.id)
+      .single();
+    expect(row?.status).toBe('completed');
+    expect(row?.winner_id).toBe(CLERK_TEST_USER_2);
+    expect(row?.ended_reason).toBe('resign');
+  });
+
+  test('a finished game cannot be resigned again', async () => {
+    const match = await startedMatch();
+    await host.rpc('resign', { p_match_id: match.id });
+    const { error } = await joiner.rpc('resign', { p_match_id: match.id });
+    expect(error?.message).toContain('match_not_active');
+  });
+
+  test('a claim before the 7-day window is rejected as too_early', async () => {
+    const match = await startedMatch();
+    // Whoever holds the move, the other player's claim must fail on time, and
+    // the mover's own claim must fail on turn — nobody can claim a fresh game.
+    const { data: row } = await host
+      .from('matches')
+      .select('current_player')
+      .eq('id', match.id)
+      .single();
+    const waiting = row!.current_player === 'player1' ? joiner : host;
+    const mover = row!.current_player === 'player1' ? host : joiner;
+
+    const { error: waitingErr } = await waiting.rpc('claim_inactive_win', { p_match_id: match.id });
+    expect(waitingErr?.message).toContain('too_early');
+
+    const { error: moverErr } = await mover.rpc('claim_inactive_win', { p_match_id: match.id });
+    expect(moverErr?.message).toContain('your_move');
+
+    // The game is untouched by the failed claims.
+    const { data: after } = await host.from('matches').select('status').eq('id', match.id).single();
+    expect(after?.status).toBe('active');
+  });
+
+  test('resign and claim are not callable anonymously', async () => {
+    const anon = createClient(SUPABASE_URL!, SUPABASE_ANON_KEY!);
+    const { error: resignErr } = await anon.rpc('resign', { p_match_id: '00000000-0000-0000-0000-000000000000' });
+    expect(resignErr?.message).toMatch(/permission denied/i);
+    const { error: claimErr } = await anon.rpc('claim_inactive_win', { p_match_id: '00000000-0000-0000-0000-000000000000' });
+    expect(claimErr?.message).toMatch(/permission denied/i);
+  });
+
+  test('an unknown match cannot be resigned', async () => {
+    const { error } = await host.rpc('resign', { p_match_id: '00000000-0000-0000-0000-000000000000' });
+    expect(error?.message).toContain('match_not_found');
+  });
+});

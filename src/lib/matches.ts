@@ -24,6 +24,7 @@ export type MatchRow = {
   current_player: 'player1' | 'player2' | null;
   phase: 'awaiting_question' | 'awaiting_answer' | null;
   winner_id: string | null;
+  ended_reason: 'guess' | 'resign' | 'claim_inactive' | null;
   first_player: 'player1' | 'player2' | null;
   created_at: string;
   last_activity_at: string;
@@ -33,7 +34,8 @@ export type MatchRow = {
 /** The columns a client is granted on `matches` (secret columns are excluded). */
 const MATCH_COLUMNS =
   'id, status, mode, party_code, player1_id, player2_id, board, current_player, phase, ' +
-  'winner_id, first_player, created_at, last_activity_at, ended_at, player1_drawn, player2_drawn';
+  'winner_id, ended_reason, first_player, created_at, last_activity_at, ended_at, ' +
+  'player1_drawn, player2_drawn';
 
 export type MatchPlayer = {
   clerk_id: string;
@@ -271,6 +273,39 @@ export async function guess(
 }
 
 /**
+ * Resign the match: an immediate forfeit — the opponent wins, the caller takes
+ * the loss. Never turn-gated; available any time the match is active (the
+ * blind draw included). The status flip lands via Realtime too, but callers
+ * should refetch the match on success so their own end screen never depends on
+ * the realtime round-trip.
+ */
+export async function resign(supabase: SupabaseClient, matchId: string): Promise<void> {
+  const { error } = await supabase.rpc('resign', { p_match_id: matchId });
+  if (error) throw friendlyTurnError(error.message, 'Could not resign this game.');
+}
+
+const CLAIM_ERRORS: Record<string, string> = {
+  your_move: "It's your move — only a stalled opponent can be claimed against.",
+  too_early: 'Your opponent still has time to move.',
+  match_not_active: 'This game is no longer active.',
+  not_a_player: "You're not a player in this match.",
+};
+
+/**
+ * Claim the win from an opponent who has held the move for 7+ days. The server
+ * re-derives eligibility (whose move it is, and the idle window from
+ * `last_activity_at`) — the client-side countdown is a convenience, never the
+ * authority. Counts as the claimer's win and the no-show's loss.
+ */
+export async function claimInactiveWin(supabase: SupabaseClient, matchId: string): Promise<void> {
+  const { error } = await supabase.rpc('claim_inactive_win', { p_match_id: matchId });
+  if (error) {
+    const friendly = CLAIM_ERRORS[error.message.trim()];
+    throw new Error(friendly ?? 'Could not claim this game.');
+  }
+}
+
+/**
  * Cross off (or un-cross) a card on the caller's own board. Private and not
  * turn-gated — it only ever writes the caller's own row.
  */
@@ -462,7 +497,9 @@ export function useBoardMarks(matchId: string | undefined) {
 /**
  * Loads a match and keeps it live via Postgres Changes. The table's membership
  * RLS policy means the subscription only ever delivers this match's rows to its
- * two players.
+ * two players. `refetch` re-reads authoritatively — call it after an action
+ * whose outcome the caller's own screen must reflect immediately (e.g. resign),
+ * so it never depends on the realtime round-trip.
  */
 export function useMatch(matchId: string | undefined) {
   const supabase = useSupabase();
@@ -470,6 +507,12 @@ export function useMatch(matchId: string | undefined) {
   const [match, setMatch] = useState<MatchRow | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  const refetch = useCallback(async () => {
+    if (!matchId) return;
+    const { data } = await supabase.from('matches').select(MATCH_COLUMNS).eq('id', matchId).single();
+    if (data) setMatch(data as unknown as MatchRow);
+  }, [matchId, supabase]);
 
   useEffect(() => {
     if (!matchId) return;
@@ -517,7 +560,7 @@ export function useMatch(matchId: string | undefined) {
     };
   }, [matchId, supabase, authNow]);
 
-  return { match, loading, error };
+  return { match, loading, error, refetch };
 }
 
 /**

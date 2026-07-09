@@ -1,5 +1,25 @@
 import { MatchEvent, MatchState, PlayerSlot } from './types';
 
+/** How long the player to move may stall before the opponent can claim the win. */
+export const CLAIM_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+function other(player: PlayerSlot): PlayerSlot {
+  return player === 'player1' ? 'player2' : 'player1';
+}
+
+/**
+ * The slot that must act next in an active match: draw order first (player 1,
+ * then player 2), the answerer during `awaiting_answer`, otherwise the current
+ * player. This is who a CLAIM_INACTIVE accuses of stalling — the claim is only
+ * valid when the *opponent* of the claimer is the one to move.
+ */
+export function playerToMove(state: MatchState): PlayerSlot {
+  if (state.player1Secret === null) return 'player1';
+  if (state.player2Secret === null) return 'player2';
+  if (state.phase === 'awaiting_answer') return other(state.currentPlayer ?? 'player1');
+  return state.currentPlayer ?? 'player1';
+}
+
 /**
  * Blind draw: a player secretly draws one card from the shared board. Player 1
  * draws first; player 2 then draws from the remaining pool, so the two secrets
@@ -163,6 +183,7 @@ function guess(state: MatchState, player: PlayerSlot, pokemonId: number): MatchS
       ...state,
       status: 'completed',
       winnerId: player === 'player1' ? state.player1Id : state.player2Id,
+      endedReason: 'guess',
       endedAt: now,
       lastActivityAt: now,
     };
@@ -179,6 +200,58 @@ function guess(state: MatchState, player: PlayerSlot, pokemonId: number): MatchS
   };
 }
 
+/**
+ * Resign: an immediate forfeit, available to either player at any point in an
+ * active match (draw phase included) and never turn-gated — you can always walk
+ * away. The opponent wins and the match ends exactly like a correct guess
+ * (`completed` + `winnerId` + `endedAt`), so downstream game-end effects (stats,
+ * notifications) ride the same status edge. Only an explicit resign forfeits;
+ * a disconnect or app-close leaves the match active and resumable.
+ */
+function resign(state: MatchState, player: PlayerSlot): MatchState {
+  if (state.status !== 'active') {
+    throw new Error('Only an active match can be resigned');
+  }
+
+  const now = new Date().toISOString();
+  return {
+    ...state,
+    status: 'completed',
+    winnerId: player === 'player1' ? state.player2Id : state.player1Id,
+    endedReason: 'resign',
+    endedAt: now,
+    lastActivityAt: now,
+  };
+}
+
+/**
+ * Claim the win from an inactive opponent. Valid only when it is the
+ * *opponent's* move ({@link playerToMove} — draw-phase aware, and during
+ * `awaiting_answer` the answerer, not the asker, is the one stalling) and
+ * nothing has happened for {@link CLAIM_WINDOW_MS} (7 days) since
+ * `lastActivityAt`. The claimer wins; the no-show takes the loss.
+ */
+function claimInactive(state: MatchState, player: PlayerSlot, nowIso: string): MatchState {
+  if (state.status !== 'active') {
+    throw new Error('Only an active match can be claimed');
+  }
+  if (playerToMove(state) !== other(player)) {
+    throw new Error('You can only claim while waiting on your opponent');
+  }
+  if (Date.parse(nowIso) - Date.parse(state.lastActivityAt) < CLAIM_WINDOW_MS) {
+    throw new Error('Your opponent still has time to move');
+  }
+
+  return {
+    ...state,
+    status: 'completed',
+    winnerId: player === 'player1' ? state.player1Id : state.player2Id,
+    endedReason: 'claim_inactive',
+    endedAt: nowIso,
+    lastActivityAt: nowIso,
+  };
+}
+
 export function reduce(state: MatchState, event: MatchEvent): MatchState {
   switch (event.type) {
     case 'DRAW_SECRET':
@@ -192,8 +265,9 @@ export function reduce(state: MatchState, event: MatchEvent): MatchState {
     case 'GUESS':
       return guess(state, event.player, event.pokemonId);
     case 'RESIGN':
+      return resign(state, event.player);
     case 'CLAIM_INACTIVE':
-      throw new Error(`${event.type} not implemented yet`);
+      return claimInactive(state, event.player, event.now ?? new Date().toISOString());
     default: {
       const exhaustive: never = event;
       return exhaustive;

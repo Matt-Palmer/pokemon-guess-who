@@ -1,9 +1,10 @@
 import { useUser } from '@clerk/clerk-expo';
 import { Image } from 'expo-image';
 import { useLocalSearchParams } from 'expo-router';
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -13,13 +14,16 @@ import {
 } from 'react-native';
 
 import { colors, typeColors } from '@/constants/colors';
+import { claimState, formatRemaining } from '@/lib/game/claim';
 import { pairThread, splitByMarks } from '@/lib/game/review';
 import {
   answerQuestion,
   askQuestion,
+  claimInactiveWin,
   drawSecret,
   guess,
   PokemonCard,
+  resign,
   useBoardMarks,
   useBoardPokemon,
   useMatch,
@@ -34,7 +38,7 @@ export default function MatchScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const { user } = useUser();
   const supabase = useSupabase();
-  const { match, loading, error } = useMatch(id);
+  const { match, loading, error, refetch } = useMatch(id);
   const cards = useBoardPokemon(match?.board);
   const { secret: mySecretId, refetch: refetchSecret } = useMySecret(id);
   const events = useMatchEvents(id, match?.last_activity_at);
@@ -52,7 +56,17 @@ export default function MatchScreen() {
   const [guessing, setGuessing] = useState(false);
   const [guessFeedback, setGuessFeedback] = useState<string | null>(null);
   const [reviewOpen, setReviewOpen] = useState(false);
+  const [ending, setEnding] = useState(false);
   const threadRef = useRef<ScrollView>(null);
+
+  // Coarse clock for the claim countdown: the window is 7 days, so a slow tick
+  // keeps the "claim in Xd Yh" copy honest without re-rendering every second.
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    if (match?.status !== 'active') return;
+    const timer = setInterval(() => setNowMs(Date.now()), 30_000);
+    return () => clearInterval(timer);
+  }, [match?.status]);
 
   // Review-panel data, derived from state the client already holds: own marks
   // (RLS-scoped to the caller) and the shared Q/A thread.
@@ -182,6 +196,76 @@ export default function MatchScreen() {
     );
   }
 
+  const oppSlot = mySlot === 'player1' ? 'player2' : 'player1';
+  const nameFor = (slot: 'player1' | 'player2', fallback: string) => {
+    const cid = slot === 'player1' ? match.player1_id : match.player2_id;
+    return (cid && players[cid]?.username) || fallback;
+  };
+  const oppName = nameFor(oppSlot, 'your opponent');
+
+  // ── Resign & inactivity claim: both end the game via server RPCs; the ──
+  // ── screen refetches on success so it never waits on Realtime.        ──
+  const doResign = async () => {
+    if (!id || ending) return;
+    setTurnError(null);
+    setEnding(true);
+    try {
+      await resign(supabase, id);
+      await refetch();
+    } catch (err: any) {
+      setTurnError(err?.message ?? 'Could not resign this game.');
+    } finally {
+      setEnding(false);
+    }
+  };
+
+  const onResign = () => {
+    Alert.alert('Resign this game?', `${oppName} wins and you take the loss.`, [
+      { text: 'Keep playing', style: 'cancel' },
+      { text: 'Resign', style: 'destructive', onPress: doResign },
+    ]);
+  };
+
+  const doClaim = async () => {
+    if (!id || ending) return;
+    setTurnError(null);
+    setEnding(true);
+    try {
+      await claimInactiveWin(supabase, id);
+      await refetch();
+    } catch (err: any) {
+      setTurnError(err?.message ?? 'Could not claim this game.');
+    } finally {
+      setEnding(false);
+    }
+  };
+
+  const onClaim = () => {
+    Alert.alert('Claim the win?', `${oppName} hasn't moved in 7 days. Claiming ends the game as your win.`, [
+      { text: 'Not yet', style: 'cancel' },
+      { text: 'Claim the win', onPress: doClaim },
+    ]);
+  };
+
+  // Countdown/claim availability while waiting on the opponent. Derived from
+  // last_activity_at (the server-only claim_notified flag never reaches
+  // clients); the server re-checks eligibility when the claim is submitted.
+  const claim = user
+    ? claimState(match, user.id, nowMs)
+    : ({ kind: 'not_applicable' } as const);
+  const claimUi =
+    claim.kind === 'claimable' ? (
+      <Pressable style={styles.claimBtn} disabled={ending} onPress={onClaim}>
+        <Text style={styles.claimBtnText}>
+          {oppName} hasn’t moved in 7 days — claim the win
+        </Text>
+      </Pressable>
+    ) : claim.kind === 'countdown' ? (
+      <Text style={styles.claimCountdown}>
+        No move from {oppName}? You can claim the win in {formatRemaining(claim.remainingMs)}.
+      </Text>
+    ) : null;
+
   // ── Blind-draw phase: cards face-down until both players have drawn. ──
   if (!bothDrawn) {
     const banner = isMyTurnToDraw
@@ -198,6 +282,11 @@ export default function MatchScreen() {
           <Text style={styles.drawTitle}>Blind draw</Text>
           <Text style={styles.drawBanner}>{banner}</Text>
           {drawError && <Text style={styles.error}>{drawError}</Text>}
+          {turnError && <Text style={styles.error}>{turnError}</Text>}
+          {claimUi}
+          <Pressable style={styles.drawResign} hitSlop={8} disabled={ending} onPress={onResign}>
+            <Text style={styles.resignText}>Resign</Text>
+          </Pressable>
         </View>
 
         {myDrawn && (
@@ -237,14 +326,6 @@ export default function MatchScreen() {
     );
   }
 
-  // ── Active play: turn loop of questions & answers over a face-up board. ──
-  const oppSlot = mySlot === 'player1' ? 'player2' : 'player1';
-  const nameFor = (slot: 'player1' | 'player2', fallback: string) => {
-    const cid = slot === 'player1' ? match.player1_id : match.player2_id;
-    return (cid && players[cid]?.username) || fallback;
-  };
-  const oppName = nameFor(oppSlot, 'your opponent');
-
   // ── Game over: reveal both secrets to winner and loser alike. ──
   if (match.status === 'completed') {
     const didIWin = match.winner_id === user?.id;
@@ -261,11 +342,28 @@ export default function MatchScreen() {
             <Image source={{ uri: card.sprite_url }} style={styles.revealSprite} contentFit="contain" />
             <Text style={styles.revealName}>{card.name}</Text>
           </>
+        ) : result ? (
+          // A resign during the blind draw can end a game before a secret exists.
+          <Text style={styles.revealName}>Never drawn</Text>
         ) : (
           <ActivityIndicator color={colors.primary} />
         )}
       </View>
     );
+
+    // How the game ended shapes the outcome copy — a forfeit or an inactivity
+    // claim must not read as a guessed secret.
+    const endSubtitle = didIWin
+      ? match.ended_reason === 'resign'
+        ? `${oppName} resigned.`
+        : match.ended_reason === 'claim_inactive'
+          ? `You claimed the win — ${oppName} didn't move for 7 days.`
+          : `You guessed ${oppName}'s secret.`
+      : match.ended_reason === 'resign'
+        ? `You resigned — ${oppName} takes the win.`
+        : match.ended_reason === 'claim_inactive'
+          ? `${oppName} claimed the win after 7 days without a move.`
+          : `${oppName} guessed your secret.`;
 
     return (
       <View style={styles.container}>
@@ -273,11 +371,7 @@ export default function MatchScreen() {
           <Text style={[styles.endTitle, didIWin ? styles.endWin : styles.endLose]}>
             {didIWin ? 'You won! 🎉' : 'You lost'}
           </Text>
-          <Text style={styles.endSubtitle}>
-            {didIWin
-              ? `You guessed ${oppName}'s secret.`
-              : `${oppName} guessed your secret.`}
-          </Text>
+          <Text style={styles.endSubtitle}>{endSubtitle}</Text>
           <View style={styles.revealRow}>
             <RevealCard label={`${oppName}'s secret`} card={oppSecretCard} />
             <RevealCard label="Your secret" card={mySecretRevealCard} />
@@ -287,6 +381,7 @@ export default function MatchScreen() {
     );
   }
 
+  // ── Active play: turn loop of questions & answers over a face-up board. ──
   const isMyTurn = match.current_player === mySlot;
   const iAsk = match.phase === 'awaiting_question' && isMyTurn;
   // The answerer is the opponent of the asker (current_player).
@@ -314,6 +409,9 @@ export default function MatchScreen() {
         </Text>
         <Pressable style={styles.reviewBtn} hitSlop={8} onPress={() => setReviewOpen(true)}>
           <Text style={styles.reviewBtnText}>Review</Text>
+        </Pressable>
+        <Pressable style={styles.resignBtn} hitSlop={8} disabled={ending} onPress={onResign}>
+          <Text style={styles.resignText}>Resign</Text>
         </Pressable>
       </View>
 
@@ -446,11 +544,14 @@ export default function MatchScreen() {
                 </Pressable>
               </View>
             ) : (
-              <Text style={styles.waitingHint}>
-                {match.phase === 'awaiting_answer'
-                  ? `Waiting for ${oppName} to answer…`
-                  : `Waiting for ${oppName}…`}
-              </Text>
+              <>
+                <Text style={styles.waitingHint}>
+                  {match.phase === 'awaiting_answer'
+                    ? `Waiting for ${oppName} to answer…`
+                    : `Waiting for ${oppName}…`}
+                </Text>
+                {claimUi}
+              </>
             )}
 
             {/* On your turn you may ask a question XOR make a guess. */}
@@ -614,6 +715,34 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   reviewBtnText: { color: colors.primary, fontWeight: '800', fontSize: 13 },
+
+  // Resign & inactivity claim
+  resignBtn: {
+    position: 'absolute',
+    left: 12,
+    top: 0,
+    bottom: 0,
+    justifyContent: 'center',
+  },
+  resignText: { color: colors.wrong, fontWeight: '800', fontSize: 13 },
+  drawResign: { marginTop: 10, padding: 4 },
+  claimCountdown: {
+    color: colors.textMuted,
+    fontSize: 12,
+    textAlign: 'center',
+    marginTop: 6,
+  },
+  claimBtn: {
+    marginTop: 10,
+    paddingVertical: 11,
+    paddingHorizontal: 14,
+    borderRadius: 10,
+    borderWidth: 1.5,
+    borderColor: colors.correct,
+    backgroundColor: colors.correctBg,
+    alignItems: 'center',
+  },
+  claimBtnText: { color: colors.correct, fontWeight: '800', fontSize: 14, textAlign: 'center' },
 
   // Review panel (slide-up over the board)
   reviewPanel: {

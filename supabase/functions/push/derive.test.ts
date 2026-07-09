@@ -25,6 +25,7 @@ function row(overrides: Partial<MatchWebhookRow> = {}): MatchWebhookRow {
     current_player: 'player1',
     phase: 'awaiting_question',
     winner_id: null,
+    ended_reason: null,
     claim_notified: false,
     ...overrides,
   };
@@ -129,6 +130,32 @@ describe('deriveNotifications', () => {
     expect(toLoser.kind).toBe('game_ended');
     expect(toLoser.body).toContain('Misty');
     expect(toLoser.url).toBe('/match/match-1');
+  });
+
+  it('phrases the game-ended copy as a resignation when the loser resigned', () => {
+    const before = row({ current_player: 'player2' });
+    const after = row({ status: 'completed', winner_id: P2, ended_reason: 'resign' });
+
+    const messages = deriveNotifications(before, after, NAMES);
+
+    expect(messages).toHaveLength(2);
+    const toWinner = messages.find((m) => m.recipientId === P2)!;
+    const toLoser = messages.find((m) => m.recipientId === P1)!;
+    expect(toWinner.body).toContain('Ash resigned');
+    expect(toLoser.body).toContain('You resigned');
+  });
+
+  it('phrases the game-ended copy as a claim when the win was claimed', () => {
+    const before = row({ current_player: 'player1' });
+    const after = row({ status: 'completed', winner_id: P2, ended_reason: 'claim_inactive' });
+
+    const messages = deriveNotifications(before, after, NAMES);
+
+    expect(messages).toHaveLength(2);
+    const toWinner = messages.find((m) => m.recipientId === P2)!;
+    const toLoser = messages.find((m) => m.recipientId === P1)!;
+    expect(toWinner.body).toContain('You claimed');
+    expect(toLoser.body).toContain('Misty claimed the win');
   });
 
   it('sends nothing for a completion without a winner (abandoned path)', () => {

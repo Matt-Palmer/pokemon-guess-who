@@ -1,5 +1,5 @@
 import { reduce } from './reducer';
-import { MatchEvent, MatchState } from './types';
+import { MatchState } from './types';
 
 /** A match that has been started: shared 24-card board drawn, no secrets yet. */
 function activeMatch(overrides: Partial<MatchState> = {}): MatchState {
@@ -16,6 +16,7 @@ function activeMatch(overrides: Partial<MatchState> = {}): MatchState {
     currentPlayer: null,
     phase: null,
     winnerId: null,
+    endedReason: null,
     firstPlayer: null,
     eliminated: { player1: [], player2: [] },
     createdAt: new Date().toISOString(),
@@ -325,13 +326,103 @@ describe('GUESS — ending the game', () => {
   });
 });
 
-describe('game reducer skeleton — events not yet implemented', () => {
-  const events: MatchEvent[] = [
-    { type: 'RESIGN', player: 'player2' },
-    { type: 'CLAIM_INACTIVE', player: 'player1' },
-  ];
+describe('RESIGN — immediate forfeit', () => {
+  test('resigning forfeits: the opponent wins and the match ends', () => {
+    const next = reduce(playingMatch('player1'), { type: 'RESIGN', player: 'player1' });
+    expect(next.status).toBe('completed');
+    expect(next.winnerId).toBe('user_2');
+    expect(next.endedReason).toBe('resign');
+    expect(next.endedAt).not.toBeNull();
+  });
 
-  test.each(events)('$type is a recognised event with no logic yet', (event) => {
-    expect(() => reduce(activeMatch(), event)).toThrow(`${event.type} not implemented yet`);
+  test('either player may resign — player 2 forfeits to player 1', () => {
+    const next = reduce(playingMatch('player1'), { type: 'RESIGN', player: 'player2' });
+    expect(next.winnerId).toBe('user_1');
+  });
+
+  test('resigning is not turn-gated — the waiting player can walk away', () => {
+    // player1's turn to ask; player2 resigns anyway.
+    const next = reduce(playingMatch('player1'), { type: 'RESIGN', player: 'player2' });
+    expect(next.status).toBe('completed');
+    expect(next.winnerId).toBe('user_1');
+  });
+
+  test('a match can be resigned during the blind draw', () => {
+    const next = reduce(activeMatch(), { type: 'RESIGN', player: 'player1' });
+    expect(next.status).toBe('completed');
+    expect(next.winnerId).toBe('user_2');
+  });
+
+  test('only an active match can be resigned — a finished game is immutable', () => {
+    expect(() =>
+      reduce(playingMatch('player1', { status: 'completed' }), { type: 'RESIGN', player: 'player1' }),
+    ).toThrow(/active/i);
+  });
+
+  test('a lobby cannot be resigned', () => {
+    expect(() =>
+      reduce(activeMatch({ status: 'lobby' }), { type: 'RESIGN', player: 'player1' }),
+    ).toThrow(/active/i);
+  });
+});
+
+describe('CLAIM_INACTIVE — 7-day inactivity claim', () => {
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const stalledAt = '2026-07-01T12:00:00.000Z';
+  const after = (days: number) => new Date(Date.parse(stalledAt) + days * DAY_MS).toISOString();
+
+  test('the waiting player claims the win once the opponent is 7 days idle', () => {
+    // player2's turn to ask and they've gone quiet; player1 claims.
+    const state = playingMatch('player2', { lastActivityAt: stalledAt });
+    const next = reduce(state, { type: 'CLAIM_INACTIVE', player: 'player1', now: after(7) });
+    expect(next.status).toBe('completed');
+    expect(next.winnerId).toBe('user_1');
+    expect(next.endedReason).toBe('claim_inactive');
+    expect(next.endedAt).toBe(after(7));
+  });
+
+  test('the claim counts as the no-show’s loss whichever seat is waiting', () => {
+    const state = playingMatch('player1', { lastActivityAt: stalledAt });
+    const next = reduce(state, { type: 'CLAIM_INACTIVE', player: 'player2', now: after(8) });
+    expect(next.winnerId).toBe('user_2');
+  });
+
+  test('a claim before 7 days is rejected — the opponent still has time', () => {
+    const state = playingMatch('player2', { lastActivityAt: stalledAt });
+    expect(() =>
+      reduce(state, { type: 'CLAIM_INACTIVE', player: 'player1', now: after(6.99) }),
+    ).toThrow(/still has time/i);
+  });
+
+  test('you cannot claim while the move is yours — only a stalled opponent forfeits', () => {
+    const state = playingMatch('player1', { lastActivityAt: stalledAt });
+    expect(() =>
+      reduce(state, { type: 'CLAIM_INACTIVE', player: 'player1', now: after(10) }),
+    ).toThrow(/waiting on your opponent/i);
+  });
+
+  test('during awaiting_answer the stalled player is the answerer, not the asker', () => {
+    // player1 asked and is waiting on player2's answer: player1 may claim…
+    const state = playingMatch('player1', { phase: 'awaiting_answer', lastActivityAt: stalledAt });
+    const next = reduce(state, { type: 'CLAIM_INACTIVE', player: 'player1', now: after(7) });
+    expect(next.winnerId).toBe('user_1');
+    // …and player2 (the one stalling) may not.
+    expect(() =>
+      reduce(state, { type: 'CLAIM_INACTIVE', player: 'player2', now: after(7) }),
+    ).toThrow(/waiting on your opponent/i);
+  });
+
+  test('a never-drawn opponent can be claimed against during the blind draw', () => {
+    // player1 drew; player2 never has. player1 waits out the window and claims.
+    const state = activeMatch({ player1Secret: 7, lastActivityAt: stalledAt });
+    const next = reduce(state, { type: 'CLAIM_INACTIVE', player: 'player1', now: after(7) });
+    expect(next.winnerId).toBe('user_1');
+  });
+
+  test('only an active match can be claimed', () => {
+    const state = playingMatch('player2', { status: 'completed', lastActivityAt: stalledAt });
+    expect(() =>
+      reduce(state, { type: 'CLAIM_INACTIVE', player: 'player1', now: after(10) }),
+    ).toThrow(/active/i);
   });
 });

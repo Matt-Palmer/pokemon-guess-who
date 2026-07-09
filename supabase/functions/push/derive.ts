@@ -23,6 +23,7 @@ export type MatchWebhookRow = {
   current_player: 'player1' | 'player2' | null;
   phase: 'awaiting_question' | 'awaiting_answer' | null;
   winner_id: string | null;
+  ended_reason: 'guess' | 'resign' | 'claim_inactive' | null;
   claim_notified: boolean;
 };
 
@@ -85,10 +86,11 @@ export function playerToMove(row: MatchWebhookRow): Slot {
  *                       answerer) is deliberately not notified.
  *  - answer_needed    → the asker's opponent, when the phase flips to
  *                       awaiting_answer.
- *  - game_ended       → both players, with win/loss copy per side. The actor's
- *                       device suppresses foreground presentation, so this is
- *                       correct whoever ended the game (guess today; resign and
- *                       claim in Issue 10 ride the same status edge).
+ *  - game_ended       → both players, with win/loss copy per side phrased by
+ *                       `ended_reason` (guess, resign, or inactivity claim —
+ *                       all ride the same status edge). The actor's device
+ *                       suppresses foreground presentation, so this is correct
+ *                       whoever ended the game.
  *  - claim_available  → the waiting player (opponent of the one who must move),
  *                       when the cron scan flips claim_notified.
  *
@@ -116,23 +118,43 @@ export function deriveNotifications(
 
   // The game ended. Notify both sides; completions without a winner (the
   // future abandoned path) notify no one, mirroring the stats trigger.
+  // `ended_reason` shapes the copy: a resignation or an inactivity claim reads
+  // very differently from a guessed secret. (The actor's own device suppresses
+  // foreground presentation, so the resigner/claimer rarely sees theirs.)
   if (before.status !== 'completed' && after.status === 'completed') {
     if (!after.winner_id || !after.player2_id) return [];
     const loserId =
       after.winner_id === after.player1_id ? after.player2_id : after.player1_id;
+    const winnerName = nameOf(names, after.winner_id);
+    const loserName = nameOf(names, loserId);
+    const bodies =
+      after.ended_reason === 'resign'
+        ? {
+            winner: `${loserName} resigned — the win is yours.`,
+            loser: `You resigned your game against ${winnerName}.`,
+          }
+        : after.ended_reason === 'claim_inactive'
+          ? {
+              winner: `You claimed your game against ${loserName} — 7 days without a move.`,
+              loser: `${winnerName} claimed the win after 7 days without a move.`,
+            }
+          : {
+              winner: `Your game against ${loserName} is over — victory!`,
+              loser: `${winnerName} won this one — rematch?`,
+            };
     return [
       {
         kind: 'game_ended',
         recipientId: after.winner_id,
         title: 'You won! 🎉',
-        body: `Your game against ${nameOf(names, loserId)} is over — victory!`,
+        body: bodies.winner,
         url: `/match/${after.id}`,
       },
       {
         kind: 'game_ended',
         recipientId: loserId,
         title: 'Game over',
-        body: `${nameOf(names, after.winner_id)} won this one — rematch?`,
+        body: bodies.loser,
         url: `/match/${after.id}`,
       },
     ];
