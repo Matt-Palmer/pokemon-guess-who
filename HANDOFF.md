@@ -1,4 +1,4 @@
-# Pokémon Guess Who — Handoff (Issue 6 complete: stats on game-end, verified against live DB)
+# Pokémon Guess Who — Handoff (Issue 7 complete: wrong-guess review panel)
 
 **Project:** `/Users/Matt/Dev/pokemon-guess-who` — Expo/expo-router + Clerk auth + Supabase (Postgres + Realtime).
 Supabase project ref `azaemyxdzapolhqmcwpq`. Issues live in `issues/`, spec in `PRD.md`.
@@ -48,11 +48,30 @@ Supabase project ref `azaemyxdzapolhqmcwpq`. Issues live in `issues/`, spec in `
     `board_marks` rows *and now real stat increments* on the `rlstest1`/`rlstest2` profiles — see the gotcha
     below.
 
-## Next steps — Issue 7: wrong-guess review panel
+- **Issue 7** (wrong-guess review panel): UI-only, **no DB changes** — the data was already client-side
+  (`useBoardMarks` own marks, `useMatchEvents` thread).
+  - **Pure derivations** `src/lib/game/review.ts`: `pairThread` groups the ordered event thread into
+    question→answer entries (answer attaches to the most recent unanswered question; orphan answers dropped) and
+    `splitByMarks` splits the board into crossed-off/remaining in board order. 9 unit tests in `review.test.ts`
+    cover the "review data derived correctly" criterion.
+  - **UI** in `src/app/match/[id].tsx`: a slide-up review panel over the board (backdrop + close, same pattern as
+    the card-detail panel) showing the player's crossed-off cards (mini grid) and the full Q/A history as paired
+    entries, with a "N crossed off · M remaining" summary. Opened two ways: a persistent **Review** button in the
+    turn banner (available in normal and guess mode), and a **"Review your clues"** link inside the wrong-guess
+    feedback box — the "readily reachable after a wrong guess" criterion. Privacy is by construction: marks are
+    RLS-scoped to the caller and the thread is the shared Q/A both players already see.
+  - **85/85 tests pass**, `tsc` clean, `npm run lint` clean. Not yet smoke-tested on device (needs two players
+    mid-match).
 
-`issues/07-wrong-guess-review-panel.md`. An in-game slide-up/toggle panel over the board showing the player's
-crossed-off cards and their full Q/A history. All the data is already client-side: `useBoardMarks` (own marks)
-and `useMatchEvents` (thread) in `src/lib/matches.ts` — this issue is UI-only, no DB changes expected.
+## Next steps — Issue 8: async & multiple games
+
+`issues/08-async-multiple-games.md`. Home screen becomes a list of all the player's active games (opponent +
+whose-turn, your-move rows highlighted); tapping resumes exactly where left off (state already rehydrates from
+Postgres — `useMatch`/`useMatchEvents`/`useBoardMarks` all load authoritatively on mount, so resume likely already
+works and mainly needs the list UI + tests). Add a cosmetic Supabase Presence "online now" indicator (never
+affects outcome). Multiple concurrent games should already be independent (all state is keyed by match id) —
+verify with tests. Likely needs an RPC or RLS-scoped query listing the caller's active matches with opponent
+usernames (a `match_players`-style SECURITY DEFINER helper), since profiles are self-readable only.
 
 ## Gotchas for the new session
 

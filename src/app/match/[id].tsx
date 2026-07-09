@@ -13,6 +13,7 @@ import {
 } from 'react-native';
 
 import { colors, typeColors } from '@/constants/colors';
+import { pairThread, splitByMarks } from '@/lib/game/review';
 import {
   answerQuestion,
   askQuestion,
@@ -50,7 +51,13 @@ export default function MatchScreen() {
   const [guessTarget, setGuessTarget] = useState<PokemonCard | null>(null);
   const [guessing, setGuessing] = useState(false);
   const [guessFeedback, setGuessFeedback] = useState<string | null>(null);
+  const [reviewOpen, setReviewOpen] = useState(false);
   const threadRef = useRef<ScrollView>(null);
+
+  // Review-panel data, derived from state the client already holds: own marks
+  // (RLS-scoped to the caller) and the shared Q/A thread.
+  const review = useMemo(() => splitByMarks(cards, marks), [cards, marks]);
+  const qaHistory = useMemo(() => pairThread(events), [events]);
 
   const mySlot = match ? (match.player1_id === user?.id ? 'player1' : 'player2') : null;
   const bothDrawn = Boolean(match?.player1_drawn && match?.player2_drawn);
@@ -305,6 +312,9 @@ export default function MatchScreen() {
             ? 'A wrong guess costs you your turn · long-press for details'
             : 'Tap a card to cross it off · long-press for details'}
         </Text>
+        <Pressable style={styles.reviewBtn} hitSlop={8} onPress={() => setReviewOpen(true)}>
+          <Text style={styles.reviewBtnText}>Review</Text>
+        </Pressable>
       </View>
 
       <ScrollView style={styles.board} contentContainerStyle={styles.grid}>
@@ -368,7 +378,16 @@ export default function MatchScreen() {
         </ScrollView>
 
         {turnError && <Text style={styles.error}>{turnError}</Text>}
-        {guessFeedback && <Text style={styles.guessFeedback}>{guessFeedback}</Text>}
+        {guessFeedback && (
+          // After a wrong guess the review panel is one tap away, so the player
+          // can regroup over their cross-offs and Q/A history.
+          <View style={styles.guessFeedback}>
+            <Text style={styles.guessFeedbackText}>{guessFeedback}</Text>
+            <Pressable hitSlop={8} onPress={() => setReviewOpen(true)}>
+              <Text style={styles.guessFeedbackLink}>Review your clues</Text>
+            </Pressable>
+          </View>
+        )}
 
         {guessMode ? (
           // Guess controls take over the input area while a guess is being made.
@@ -443,6 +462,70 @@ export default function MatchScreen() {
           </>
         )}
       </View>
+
+      {reviewOpen && (
+        <>
+          <Pressable
+            style={styles.detailBackdrop}
+            onPress={() => setReviewOpen(false)}
+            accessibilityLabel="Close review"
+          />
+          <View style={styles.reviewPanel}>
+            <View style={styles.reviewHeader}>
+              <Text style={styles.reviewTitle}>Review</Text>
+              <Text style={styles.reviewSummary}>
+                {review.crossedOff.length} crossed off · {review.remaining.length} remaining
+              </Text>
+              <Pressable
+                style={styles.detailClose}
+                hitSlop={16}
+                onPress={() => setReviewOpen(false)}>
+                <Text style={styles.detailCloseText}>✕</Text>
+              </Pressable>
+            </View>
+            <ScrollView contentContainerStyle={styles.reviewContent}>
+              <Text style={styles.reviewSection}>Your crossed-off cards</Text>
+              {review.crossedOff.length === 0 ? (
+                <Text style={styles.reviewEmpty}>Nothing crossed off yet.</Text>
+              ) : (
+                <View style={styles.reviewGrid}>
+                  {review.crossedOff.map((card) => (
+                    <View key={card.id} style={styles.reviewCard}>
+                      <Image
+                        source={{ uri: card.sprite_url }}
+                        style={styles.reviewSprite}
+                        contentFit="contain"
+                      />
+                      <Text style={styles.reviewCardName} numberOfLines={1}>
+                        {card.name}
+                      </Text>
+                    </View>
+                  ))}
+                </View>
+              )}
+
+              <Text style={styles.reviewSection}>Questions & answers</Text>
+              {qaHistory.length === 0 ? (
+                <Text style={styles.reviewEmpty}>No questions asked yet.</Text>
+              ) : (
+                qaHistory.map(({ question, answer }) => (
+                  <View key={question.id} style={styles.reviewQa}>
+                    <Text style={styles.reviewQaMeta}>
+                      {question.author_id === user?.id
+                        ? 'You asked'
+                        : `${nameFor(question.author_slot, 'Opponent')} asked`}
+                    </Text>
+                    <Text style={styles.reviewQuestion}>{question.body}</Text>
+                    <Text style={styles.reviewAnswer}>
+                      {answer ? answer.body : 'Awaiting answer…'}
+                    </Text>
+                  </View>
+                ))
+              )}
+            </ScrollView>
+          </View>
+        </>
+      )}
 
       {selected && (
         <>
@@ -523,17 +606,95 @@ const styles = StyleSheet.create({
   turnBannerGuess: { backgroundColor: colors.correctBg, borderBottomColor: colors.correct },
   turnText: { fontSize: 16, fontWeight: '800', color: colors.text },
   turnHint: { fontSize: 11, color: colors.textMuted, marginTop: 2 },
+  reviewBtn: {
+    position: 'absolute',
+    right: 12,
+    top: 0,
+    bottom: 0,
+    justifyContent: 'center',
+  },
+  reviewBtnText: { color: colors.primary, fontWeight: '800', fontSize: 13 },
+
+  // Review panel (slide-up over the board)
+  reviewPanel: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    maxHeight: '75%',
+    backgroundColor: colors.card,
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+    zIndex: 11,
+    elevation: 11,
+  },
+  reviewHeader: {
+    alignItems: 'center',
+    paddingTop: 14,
+    paddingBottom: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.border,
+  },
+  reviewTitle: { fontSize: 18, fontWeight: '800', color: colors.text },
+  reviewSummary: { fontSize: 12, color: colors.textMuted, marginTop: 2 },
+  reviewContent: { padding: 16, paddingBottom: 28 },
+  reviewSection: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: colors.textMuted,
+    textTransform: 'uppercase',
+    marginBottom: 8,
+    marginTop: 12,
+  },
+  reviewEmpty: { color: colors.textMuted, fontStyle: 'italic', marginBottom: 4 },
+  reviewGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  reviewCard: {
+    width: '15%',
+    minWidth: 52,
+    alignItems: 'center',
+    backgroundColor: colors.background,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: colors.border,
+    padding: 4,
+    opacity: 0.75,
+  },
+  reviewSprite: { width: 40, height: 40 },
+  reviewCardName: {
+    fontSize: 9,
+    color: colors.textMuted,
+    textTransform: 'capitalize',
+    textDecorationLine: 'line-through',
+  },
+  reviewQa: {
+    backgroundColor: colors.background,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: colors.border,
+    padding: 10,
+    marginBottom: 8,
+  },
+  reviewQaMeta: { fontSize: 11, color: colors.textMuted, fontWeight: '600' },
+  reviewQuestion: { fontSize: 15, color: colors.text, marginTop: 2 },
+  reviewAnswer: { fontSize: 15, color: colors.text, fontWeight: '700', marginTop: 4 },
 
   // Guessing
   guessFeedback: {
-    color: colors.wrong,
     backgroundColor: colors.wrongBg,
-    fontWeight: '700',
-    textAlign: 'center',
+    alignItems: 'center',
     paddingVertical: 8,
     borderRadius: 10,
     marginBottom: 8,
     overflow: 'hidden',
+  },
+  guessFeedbackText: { color: colors.wrong, fontWeight: '700', textAlign: 'center' },
+  guessFeedbackLink: {
+    color: colors.wrong,
+    fontWeight: '800',
+    textDecorationLine: 'underline',
+    marginTop: 4,
   },
   guessStartBtn: {
     marginTop: 10,
