@@ -693,3 +693,138 @@ function clientFor(jwt: string) {
     });
   });
 });
+
+(hasLiveConfig ? describe : describe.skip)('async & multiple games (my_matches)', () => {
+  let host: SupabaseClient;
+  let joiner: SupabaseClient;
+
+  beforeAll(async () => {
+    const [jwtA, jwtB] = await Promise.all([
+      mintSessionToken(CLERK_TEST_USER_1!),
+      mintSessionToken(CLERK_TEST_USER_2!),
+    ]);
+    host = clientFor(jwtA);
+    joiner = clientFor(jwtB);
+    await host.from('profiles').upsert({ clerk_id: CLERK_TEST_USER_1, username: 'rlstest1' });
+    await joiner.from('profiles').upsert({ clerk_id: CLERK_TEST_USER_2, username: 'rlstest2' });
+  });
+
+  async function listFor(client: SupabaseClient): Promise<any[]> {
+    const { data, error } = await client.rpc('my_matches');
+    expect(error).toBeNull();
+    return data as any[];
+  }
+
+  /** Drive a match through join/start/draws; resolve the coin flip into asker/answerer. */
+  async function activeMatch() {
+    const { data: party } = await host.rpc('create_party');
+    await joiner.rpc('join_party', { p_code: party.party_code });
+    const { data: started } = await host.rpc('start_match', { p_match_id: party.id });
+    await host.rpc('draw_secret', { p_match_id: started.id, p_pokemon_id: started.board[0] });
+    await joiner.rpc('draw_secret', { p_match_id: started.id, p_pokemon_id: started.board[1] });
+    const { data: row } = await host
+      .from('matches')
+      .select('current_player')
+      .eq('id', started.id)
+      .single();
+    const askerSlot = row!.current_player as 'player1' | 'player2';
+    return {
+      id: started.id as string,
+      board: started.board as number[],
+      askerSlot,
+      asker: askerSlot === 'player1' ? host : joiner,
+      answerer: askerSlot === 'player1' ? joiner : host,
+    };
+  }
+
+  test('my_matches shows the game to both players with the correct opponent', async () => {
+    const { data: party } = await host.rpc('create_party');
+
+    // Open lobby: listed for the host with the seat still empty.
+    let row = (await listFor(host)).find((r) => r.id === party.id);
+    expect(row.status).toBe('lobby');
+    expect(row.party_code).toBe(party.party_code);
+    expect(row.opponent_username).toBeNull();
+
+    await joiner.rpc('join_party', { p_code: party.party_code });
+
+    // Each player sees the *other* as the opponent.
+    row = (await listFor(host)).find((r) => r.id === party.id);
+    expect(row.opponent_username).toBe('rlstest2');
+    const joinerRow = (await listFor(joiner)).find((r) => r.id === party.id);
+    expect(joinerRow.opponent_username).toBe('rlstest1');
+
+    // The list mirrors the client-granted match columns — never the secrets.
+    expect(row).not.toHaveProperty('player1_secret');
+    expect(row).not.toHaveProperty('player2_secret');
+  });
+
+  test('my_matches is not callable anonymously', async () => {
+    const anon = createClient(SUPABASE_URL!, SUPABASE_ANON_KEY!);
+    const { error } = await anon.rpc('my_matches');
+    expect(error?.message).toMatch(/permission denied/i);
+  });
+
+  test('a player holds multiple concurrent games, each independent', async () => {
+    const a = await activeMatch();
+    const b = await activeMatch();
+
+    await a.asker.rpc('ask_question', { p_match_id: a.id, p_question: 'Is it red?' });
+
+    // Acting in A advanced only A; B still awaits its first question.
+    const { data: rowA } = await host.from('matches').select('phase').eq('id', a.id).single();
+    const { data: rowB } = await host.from('matches').select('phase').eq('id', b.id).single();
+    expect(rowA!.phase).toBe('awaiting_answer');
+    expect(rowB!.phase).toBe('awaiting_question');
+
+    // Both are listed, most recently active first (A just acted).
+    const ids = (await listFor(host)).map((r) => r.id);
+    expect(ids).toContain(a.id);
+    expect(ids).toContain(b.id);
+    expect(ids.indexOf(a.id)).toBeLessThan(ids.indexOf(b.id));
+  });
+
+  test('a finished game leaves the active list', async () => {
+    const m = await activeMatch();
+    const opponentSecret = m.askerSlot === 'player1' ? m.board[1] : m.board[0];
+    await m.asker.rpc('guess', { p_match_id: m.id, p_pokemon_id: opponentSecret });
+
+    const ids = (await listFor(host)).map((r) => r.id);
+    expect(ids).not.toContain(m.id);
+  });
+
+  test('resume rehydrates the full match state from Postgres', async () => {
+    const m = await activeMatch();
+    await m.asker.rpc('ask_question', { p_match_id: m.id, p_question: 'Does it have wings?' });
+    await m.answerer.rpc('answer_question', { p_match_id: m.id, p_answer: 'Yes' });
+    await m.asker.rpc('set_board_mark', { p_match_id: m.id, p_pokemon_id: m.board[2], p_eliminated: true });
+    await m.asker.rpc('set_board_mark', { p_match_id: m.id, p_pokemon_id: m.board[3], p_eliminated: true });
+
+    // A "fresh app open" is a brand-new client: no cached state, everything the
+    // match screen mounts from must come back from Postgres.
+    const askerUserId = m.askerSlot === 'player1' ? CLERK_TEST_USER_1! : CLERK_TEST_USER_2!;
+    const fresh = clientFor(await mintSessionToken(askerUserId));
+
+    const listed = (await listFor(fresh)).find((r) => r.id === m.id);
+    expect(listed.status).toBe('active');
+    expect(listed.board).toEqual(m.board);
+    expect(listed.phase).toBe('awaiting_question');
+    expect(listed.current_player).not.toBe(m.askerSlot); // the answer passed the turn
+
+    const { data: secret } = await fresh.rpc('my_secret', { p_match_id: m.id });
+    expect(secret).toBe(m.askerSlot === 'player1' ? m.board[0] : m.board[1]);
+
+    const { data: events } = await fresh
+      .from('match_events')
+      .select('kind, body')
+      .eq('match_id', m.id)
+      .order('created_at', { ascending: true });
+    expect(events).toEqual([
+      { kind: 'question', body: 'Does it have wings?' },
+      { kind: 'answer', body: 'Yes' },
+    ]);
+
+    const { data: marks } = await fresh.from('board_marks').select('pokemon_id').eq('match_id', m.id);
+    expect(new Set(marks!.map((r) => r.pokemon_id))).toEqual(new Set([m.board[2], m.board[3]]));
+  });
+});

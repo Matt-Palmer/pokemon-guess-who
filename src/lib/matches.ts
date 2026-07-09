@@ -41,6 +41,12 @@ export type MatchPlayer = {
   avatar: string | null;
 };
 
+/** A row from `my_matches`: the client-visible match columns plus the opponent's public identity. */
+export type MyMatchRow = MatchRow & {
+  opponent_username: string | null;
+  opponent_avatar: string | null;
+};
+
 /** One entry in a match's question/answer thread. */
 export type MatchEventRow = {
   id: string;
@@ -512,6 +518,104 @@ export function useMatch(matchId: string | undefined) {
   }, [matchId, supabase, authNow]);
 
   return { match, loading, error };
+}
+
+/**
+ * The caller's open (lobby/active) games with each opponent's public identity,
+ * most recently active first — the home-screen list. Backed by the `my_matches`
+ * RPC, since `profiles` rows are self-readable only.
+ *
+ * Freshness has two layers: `refetch` (call it on screen focus) and a Realtime
+ * subscription to `matches` changes. The subscription is unfiltered — the
+ * membership RLS policy already scopes delivery to the caller's own matches —
+ * so any turn/status/join change to any of the caller's games triggers an
+ * authoritative refetch. The refetch keeps the RPC as the single source of
+ * truth (a change payload lacks the opponent join and can't signal new rows
+ * the socket joined too late to see).
+ */
+export function useMyMatches() {
+  const supabase = useSupabase();
+  const authNow = useRealtimeAuth(supabase);
+  const [matches, setMatches] = useState<MyMatchRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const refetch = useCallback(async () => {
+    const { data, error: rpcError } = await supabase.rpc('my_matches');
+    if (rpcError) {
+      setError(rpcError.message);
+    } else {
+      setError(null);
+      setMatches((data as MyMatchRow[]) ?? []);
+    }
+    setLoading(false);
+  }, [supabase]);
+
+  useEffect(() => {
+    refetch();
+  }, [refetch]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let channel: RealtimeChannel | undefined;
+
+    (async () => {
+      await authNow();
+      if (cancelled) return;
+      channel = supabase
+        .channel('my_matches')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'matches' }, () => {
+          if (!cancelled) refetch();
+        })
+        .subscribe();
+    })();
+
+    return () => {
+      cancelled = true;
+      if (channel) supabase.removeChannel(channel);
+    };
+  }, [supabase, authNow, refetch]);
+
+  return { matches, loading, error, refetch };
+}
+
+/**
+ * Cosmetic presence: the set of clerk ids currently online (app open). Joins a
+ * single shared presence channel keyed by the caller's own id and mirrors its
+ * sync state. Purely informational — nothing about a game's outcome may ever
+ * depend on it (the PRD forbids presence-triggered forfeits).
+ */
+export function useOnlinePlayers(myId: string | undefined) {
+  const supabase = useSupabase();
+  const authNow = useRealtimeAuth(supabase);
+  const [online, setOnline] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (!myId) return;
+    let cancelled = false;
+    let channel: RealtimeChannel | undefined;
+
+    (async () => {
+      await authNow();
+      if (cancelled) return;
+      channel = supabase.channel('online', { config: { presence: { key: myId } } });
+      channel
+        .on('presence', { event: 'sync' }, () => {
+          if (cancelled || !channel) return;
+          setOnline(new Set(Object.keys(channel.presenceState())));
+        })
+        .subscribe(async (status) => {
+          if (status === 'SUBSCRIBED') await channel?.track({ online_at: new Date().toISOString() });
+        });
+    })();
+
+    return () => {
+      cancelled = true;
+      if (channel) supabase.removeChannel(channel);
+    };
+  }, [myId, supabase, authNow]);
+
+  return online;
 }
 
 /** Reads the public identity (username/avatar) of a match's two players. */

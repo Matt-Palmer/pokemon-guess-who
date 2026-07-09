@@ -1,4 +1,4 @@
-# Pokémon Guess Who — Handoff (Issue 7 complete: wrong-guess review panel)
+# Pokémon Guess Who — Handoff (Issue 8 complete: async & multiple games)
 
 **Project:** `/Users/Matt/Dev/pokemon-guess-who` — Expo/expo-router + Clerk auth + Supabase (Postgres + Realtime).
 Supabase project ref `azaemyxdzapolhqmcwpq`. Issues live in `issues/`, spec in `PRD.md`.
@@ -62,16 +62,36 @@ Supabase project ref `azaemyxdzapolhqmcwpq`. Issues live in `issues/`, spec in `
     RLS-scoped to the caller and the thread is the shared Q/A both players already see.
   - **85/85 tests pass**, `tsc` clean, `npm run lint` clean. Not yet smoke-tested on device (needs two players
     mid-match).
+- **Issue 8** (async & multiple games): home screen is now the active-games list; applied to the live DB and
+  verified by the integration suite.
+  - **Pure whose-turn derivation** `src/lib/game/summary.ts`: `summarizeTurn(match, myId)` → `{ myMove, kind }`
+    across lobby (host waiting / ready to start / joiner waiting), draw order, question/answer phases, finished.
+    UI maps `kind` → copy; the derivation never needs names. 9 unit tests in `summary.test.ts`.
+  - **Migration `00008_my_matches`:** `my_matches()` SECURITY DEFINER RPC — the caller's lobby/active matches
+    with `opponent_username`/`opponent_avatar` (profiles are self-readable only, so the list-shaped sibling of
+    `match_players`), ordered by `last_activity_at` desc. Returned columns exactly mirror the client-granted
+    `MATCH_COLUMNS` — **no secret columns** (integration-tested, plus anon execution denied).
+  - **Client hooks** in `src/lib/matches.ts`: `useMyMatches` (RPC fetch + `refetch` + an *unfiltered* Realtime
+    subscription on `matches` — membership RLS scopes delivery — that triggers an authoritative refetch on any
+    change to any of the caller's games) and `useOnlinePlayers` (cosmetic Supabase Presence on a shared `online`
+    channel keyed by clerk id; PRD forbids presence ever affecting outcomes).
+  - **Home screen** `src/app/(tabs)/index.tsx`: FlatList of games — `vs <opponent>` (or `Party <code>` while the
+    seat is open), whose-turn copy, **Your move** badge + highlighted border when `myMove`, green online dot from
+    presence. Tap resumes: `lobby/[id]` for lobbies, `match/[id]` otherwise (all match screens already rehydrate
+    authoritatively from Postgres on mount). Refetch on tab focus.
+  - **99/99 tests pass** (new live-DB block: list correct for both players incl. open-lobby + opponent identity,
+    anon denied, concurrent games independent + activity ordering, finished games drop off, resume rehydrates
+    match row/secret/thread/marks via a **fresh client**), `tsc` clean, lint clean, advisors clean (only the
+    by-design SECURITY DEFINER WARNs; `my_matches` joins that list). Not yet smoke-tested on device.
 
-## Next steps — Issue 8: async & multiple games
+## Next steps — Issue 9: push notifications
 
-`issues/08-async-multiple-games.md`. Home screen becomes a list of all the player's active games (opponent +
-whose-turn, your-move rows highlighted); tapping resumes exactly where left off (state already rehydrates from
-Postgres — `useMatch`/`useMatchEvents`/`useBoardMarks` all load authoritatively on mount, so resume likely already
-works and mainly needs the list UI + tests). Add a cosmetic Supabase Presence "online now" indicator (never
-affects outcome). Multiple concurrent games should already be independent (all state is keyed by match id) —
-verify with tests. Likely needs an RPC or RLS-scoped query listing the caller's active matches with opponent
-usernames (a `match_players`-style SECURITY DEFINER helper), since profiles are self-readable only.
+`issues/09-push-notifications.md`. Server-side push via a Supabase Edge Function triggered by DB webhooks:
+register for Expo push in the app and store the token on `profiles.expo_push_token` (column + client grant
+already exist), then notify on turn/answer-needed, game-ended, party-joined, and claim-available — never for
+chat messages. Tapping a notification deep-links to the game. Edge Functions deploy via the Supabase MCP
+(`deploy_edge_function`); note DB webhooks will need configuring, and the Edge Function must pick the correct
+recipient per event type (tests required for that selection logic).
 
 ## Gotchas for the new session
 
