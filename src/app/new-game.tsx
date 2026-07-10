@@ -94,8 +94,13 @@ export default function NewGameScreen() {
 
       <View style={styles.divider} />
 
-      <Pressable style={[styles.button, styles.buttonMuted]} disabled>
-        <Text style={styles.buttonMutedText}>Find a random game (coming soon)</Text>
+      <Text style={styles.sectionTitle}>Random game</Text>
+      <Text style={styles.help}>Get matched with the longest-waiting player.</Text>
+      <Pressable
+        style={[styles.buttonSecondary, disabled && styles.buttonDisabled]}
+        onPress={() => router.replace('/matchmaking')}
+        disabled={disabled}>
+        <Text style={styles.buttonSecondaryText}>Find a random game</Text>
       </Pressable>
     </View>
   );
@@ -116,8 +121,6 @@ const styles = StyleSheet.create({
   },
   buttonSecondaryText: { color: colors.primary, fontWeight: '700', fontSize: 16 },
   buttonDisabled: { opacity: 0.6 },
-  buttonMuted: { backgroundColor: colors.border },
-  buttonMutedText: { color: colors.textMuted, fontWeight: '600' },
   input: {
     borderWidth: 1,
     borderColor: colors.border,

@@ -1,4 +1,4 @@
-# Pokémon Guess Who — Handoff (Issue 10 complete: resign & inactivity claim)
+# Pokémon Guess Who — Handoff (Issue 11 complete: random matchmaking — ALL ISSUES DONE)
 
 **Project:** `/Users/Matt/Dev/pokemon-guess-who` — Expo/expo-router + Clerk auth + Supabase (Postgres + Realtime).
 Supabase project ref `azaemyxdzapolhqmcwpq`. Issues live in `issues/`, spec in `PRD.md`.
@@ -153,16 +153,61 @@ Supabase project ref `azaemyxdzapolhqmcwpq`. Issues live in `issues/`, spec in `
     by-design SECURITY DEFINER WARNs; `resign`/`claim_inactive_win` join that list). Not yet smoke-tested on
     device.
 
-## Next steps — Issue 11: random matchmaking
+- **Issue 11** (random matchmaking): applied to the live DB, verified by the integration suite (incl. the
+  concurrency-hammer criterion). **This was the final issue — `issues/` is fully complete.**
+  - **Migration `00012_random_matchmaking`:** `matchmaking_queue` (`user_id` PK → profiles, `enqueued_at`,
+    `last_seen_at` heartbeat, `matched_match_id`) — RPC-only surface: RLS on with **no policies** and all table
+    privileges revoked (advisors now show an intentional INFO "RLS enabled no policy" for it). Two RPCs:
+    - `find_random_game()` — one idempotent SECURITY DEFINER call for enqueue AND every poll tick. Concurrency
+      scheme (the acceptance criterion): the caller **upserts its own row first** — that row lock is a mutex, so
+      two simultaneous scanners skip each other instead of each grabbing the other (never two matches); the
+      candidate scan is `FOR UPDATE SKIP LOCKED` over the longest-waiting live row (never the same opponent
+      twice); nothing ever waits on a lock, so it's deadlock-free. ⚠️ The **pickup check must run strictly
+      AFTER the upsert** (the upsert waits out an in-flight `matched_match_id` stamp and returns it): the first
+      draft checked before, and the integration storm test caught a real double-match — a caller could overlook
+      an incoming stamp and pair a second time. Pairing creates the match directly (`mode='random'`,
+      `status='active'`, server-generated 24-card board, **waiter = player1** so the longest-waiting player
+      draws first — no lobby); the waiter learns of it via the stamp on their queue row on their next poll.
+      Liveness: candidates must have polled within 30s (no pairing against force-quit searchers); rows stale
+      5+ min are GC'd opportunistically.
+    - `cancel_matchmaking()` — dequeues; if a pairing already landed it returns that match id instead (the
+      opponent is committed to a real game — the client proceeds into it rather than stranding them).
+  - **Client:** `src/lib/matchmaking.ts` — RPC wrappers + `useMatchmaking()` (sequential jittered ~2s poll
+    loop — jitter matters: perfectly synchronized pollers would SKIP-LOCKED-skip each other forever; cancel
+    resolves the cancel-vs-paired race by flipping to `matched`; unmount fire-and-forget dequeues an unmatched
+    search). Searching screen `src/app/matchmaking.tsx` (spinner + working Cancel, then a 3s
+    "Opponent found: [username]" confirmation via `match_players` before `router.replace` into `/match/[id]`);
+    route registered in `_layout.tsx`; "Find a random game" enabled in `new-game.tsx`. No push changes needed:
+    the push trigger is AFTER UPDATE and both players are actively in-app when paired.
+  - **150/150 tests pass** (9 new integration: pair + waiter pickup, match shape (active/random/24-card
+    board/waiter-as-player1/no code), cancel dequeues, cancel-after-pairing returns the match, 6 concurrent
+    joins against one waiter create exactly one match, two simultaneously-searching players converge on one
+    shared match (sequential jittered loops, modelling the real client — duplicate *concurrent* calls by the
+    same user are indistinguishable from a new search and can legitimately re-enqueue), matched game plays the
+    standard blind draw into active play + appears in `my_matches` with opponent identity, anon denied, queue
+    not client-readable/writable). `tsc` clean, lint clean, advisors clean (by-design SECURITY DEFINER WARNs —
+    `find_random_game`/`cancel_matchmaking` join the list — plus the intentional queue INFO above). Not yet
+    smoke-tested on device.
 
-`issues/11-random-matchmaking.md`. A `matchmaking_queue` table + atomic pairing RPC (row locking so two
-players never grab the same opponent — the concurrency safety is the acceptance criterion to prove), enqueue
-via "Find a random game", a Searching screen with working Cancel (dequeue), and an "Opponent found: [username]"
-confirmation before dropping both players into the standard board/draw/play flow (`mode='random'` already
-exists on `matches`). Integration tests should hammer the pairing RPC concurrently.
+## Next steps
+
+All 11 issues are complete. Remaining known gaps, in rough priority order:
+
+- **Device smoke tests**: Issues 7, 8, 10 and 11 have never been exercised on a real device (need two players
+  mid-match). The full flows are integration-tested against the live DB.
+- **Real push delivery**: needs `eas init` (EAS projectId) + a development build — see the gotcha below. The
+  entire server pipeline is already live and verified on the wire.
+- Possible polish: matchmaking currently allows being paired with someone you already have an active game
+  with (fine for a tiny player base — party mode exists for friends); `abandoned` status exists in the schema
+  but nothing sets it (resign/claim cover the real cases).
 
 ## Gotchas for the new session
 
+- **`expo-notifications` has no web implementation** — its functions throw on `expo start --web`. All entry
+  points are guarded: the module-scope `setNotificationHandler` and `getPushTokenOrNull` bail on
+  `Platform.OS === 'web'` (note web reports `Device.isDevice = true`), and `NotificationDeepLinker` is only
+  mounted on native in `_layout.tsx` (the guard must wrap the *mount* — `useLastNotificationResponse` is a hook
+  and can't be called conditionally). Keep any new notification code behind the same guards.
 - **Real device pushes need an EAS projectId + dev build.** `getExpoPushTokenAsync` requires
   `extra.eas.projectId` in app.json (not yet configured — run `eas init`), and Expo Go dropped remote-push
   support in SDK 53, so a development build is required. Until then `usePushRegistration` silently no-ops
@@ -196,6 +241,11 @@ exists on `matches`). Integration tests should hammer the pairing RPC concurrent
   deleting** — the user may be mid-testing with live rows. ⚠️ Deleting `matches` history makes trigger-accumulated
   counters diverge from `recompute_my_stats` (which replays surviving history) — after a cleanup, either recompute
   or zero the test profiles' counters too. The recompute-parity integration test is self-consistent either way.
+- **The matchmaking queue must be empty between integration tests** — a leftover row would pair against a
+  stale search and make the next test assert nonsense. `matchmaking.test.ts` cancels both users in `afterEach`;
+  keep that if you add tests. The paired *matches* it creates stay behind like all the others (gotcha below).
+  Note `find_random_game` is deliberately one-search-per-user (PK on `user_id`): duplicate concurrent calls
+  from the same user serialize on the row lock, and a call arriving after pickup starts a *new* search.
 - **Profiles stat columns are not client-writable** (column-level grants, Issue 6). If a new feature needs to
   write a new profile column from the client, it must be added to the column-level INSERT/UPDATE grant lists —
   a plain `alter table add column` will be readable but not writable by `authenticated`.

@@ -13,14 +13,20 @@ import { useSupabase } from '@/lib/supabase';
 // shows every state change live (Realtime), so foreground presentation is
 // suppressed entirely. This also makes the server's game-ended send-to-both
 // correct — the player who just ended the game never sees their own push.
-Notifications.setNotificationHandler({
-  handleNotification: async () => ({
-    shouldShowBanner: false,
-    shouldShowList: false,
-    shouldPlaySound: false,
-    shouldSetBadge: false,
-  }),
-});
+//
+// expo-notifications has no web implementation (its module functions throw on
+// web), so every entry point in this file is native-only — including this
+// module-scope call, which would otherwise crash `expo start --web` at import.
+if (Platform.OS !== 'web') {
+  Notifications.setNotificationHandler({
+    handleNotification: async () => ({
+      shouldShowBanner: false,
+      shouldShowList: false,
+      shouldPlaySound: false,
+      shouldSetBadge: false,
+    }),
+  });
+}
 
 /**
  * The device's Expo push token, or null wherever push can't work: simulators,
@@ -29,7 +35,9 @@ Notifications.setNotificationHandler({
  * denied. Callers treat null as "this install doesn't receive pushes".
  */
 async function getPushTokenOrNull(): Promise<string | null> {
-  if (!Device.isDevice) return null;
+  // Web reports Device.isDevice = true, but the notifications module isn't
+  // available there — bail before touching it.
+  if (Platform.OS === 'web' || !Device.isDevice) return null;
 
   const projectId: string | undefined =
     Constants.expoConfig?.extra?.eas?.projectId ?? Constants.easConfig?.projectId;
