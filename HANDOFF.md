@@ -1,4 +1,4 @@
-# Pokémon Guess Who — Handoff (Issue 11 complete: random matchmaking — ALL ISSUES DONE)
+# Pokémon Guess Who — Handoff (Issue 12 complete: UI/UX redesign underway — issues 13–16 remain)
 
 **Project:** `/Users/Matt/Dev/pokemon-guess-who` — Expo/expo-router + Clerk auth + Supabase (Postgres + Realtime).
 Supabase project ref `azaemyxdzapolhqmcwpq`. Issues live in `issues/`, spec in `PRD.md`.
@@ -189,9 +189,31 @@ Supabase project ref `azaemyxdzapolhqmcwpq`. Issues live in `issues/`, spec in `
     `find_random_game`/`cancel_matchmaking` join the list — plus the intentional queue INFO above). Not yet
     smoke-tested on device.
 
+- **Issue 12** (design system — first issue of the UI/UX redesign, issues 12–16): the redesign was scoped in a
+  grilling session (2026-07-10); direction and vocabulary live in `CONTEXT.md`, per-issue specs in
+  `issues/12…16`. Direction: **playful board-game** (warm tabletop palette, tactile pieces, one rich light
+  theme; Pokémon flavor via content, not chrome). Presentation layer only — no reducer/RPC/DB changes anywhere
+  in 12–16.
+  - **`src/ui/`**: `theme.ts` semantic tokens (colors/spacing/radii/shadows/type — hard cardboard shadows on
+    iOS, elevation fallback); components `Screen`, `Button` (physical face-on-edge press animation, Reanimated),
+    `Card`, `CardModal` (the house overlay pattern — card over dimmed backdrop, tap-outside dismiss),
+    `Badge`, `TextField`. Zero new dependencies.
+  - **`constants/colors.ts`** is now deprecated aliases re-pointed at theme values, so every unmigrated screen
+    picked up the warm palette immediately (incl. router headers/tab bar); each of 13–16 moves its screens onto
+    `@/ui` directly, then the alias file dies. `typeColors` is content and stays.
+  - **new-game + profile** restyled onto the shared components as the proving ground (full UX rework of those
+    flows is still issues 15/16). Verified in the web preview signed in as `rlstest1`: warm palette everywhere,
+    3D buttons, player-card profile with stat tiles.
+  - `tsc` clean, lint clean, unit suites 92/92 (reducer/stats/review/summary/claim/derive). Integration suites
+    untouched (live-DB; presentation-only change). Not yet smoke-tested on a real device.
+  - ⚠️ react-native-web logs a `"shadow*" style props are deprecated. Use "boxShadow"` warning — cosmetic,
+    web-only; native is the design target (iPhone portrait first, per the grilling decisions).
+
 ## Next steps
 
-All 11 issues are complete. Remaining known gaps, in rough priority order:
+Issues 1–12 are complete. **Redesign issues remain: 13 (match screen restructure — board on one screen, chat
+bubble/modal, turn strip + ADR 0001), 14 (motion), 15 (home + new-game flow), 16 (auth + player card)** — specs
+in `issues/`. Other known gaps, in rough priority order:
 
 - **Device smoke tests**: Issues 7, 8, 10 and 11 have never been exercised on a real device (need two players
   mid-match). The full flows are integration-tested against the live DB.

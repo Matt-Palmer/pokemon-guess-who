@@ -1,11 +1,11 @@
 import { useAuth } from '@clerk/clerk-expo';
 import { useFocusEffect } from 'expo-router';
 import { useCallback } from 'react';
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
 
-import { colors } from '@/constants/colors';
 import { winRatePercent } from '@/lib/game/stats';
 import { useProfile } from '@/lib/profile';
+import { Button, Card, Screen, colors, radii, spacing, type } from '@/ui';
 
 export default function ProfileScreen() {
   const { signOut } = useAuth();
@@ -21,60 +21,86 @@ export default function ProfileScreen() {
 
   if (loading) {
     return (
-      <View style={styles.center}>
+      <Screen style={styles.center}>
         <ActivityIndicator color={colors.primary} />
-      </View>
+      </Screen>
     );
   }
 
   if (error || !profile) {
     return (
-      <View style={styles.center}>
+      <Screen style={styles.center}>
         <Text style={styles.error}>{error ?? 'Profile not found'}</Text>
-      </View>
+      </Screen>
     );
   }
 
   const winRate = winRatePercent(profile.wins, profile.games_played);
 
   return (
-    <View style={styles.container}>
-      <Text style={styles.username}>{profile.username}</Text>
-      <View style={styles.statsRow}>
+    <Screen>
+      <Card style={styles.playerCard}>
+        <View style={styles.avatar}>
+          <Text style={styles.avatarText}>
+            {profile.avatar ?? profile.username.charAt(0).toUpperCase()}
+          </Text>
+        </View>
+        <Text style={styles.username}>{profile.username}</Text>
+      </Card>
+
+      <View style={styles.statsGrid}>
         <Stat label="Played" value={profile.games_played} />
         <Stat label="Wins" value={profile.wins} />
         <Stat label="Losses" value={profile.losses} />
-      </View>
-      <View style={styles.statsRow}>
         <Stat label="Win rate" value={`${winRate}%`} />
         <Stat label="Streak" value={profile.current_streak} />
         <Stat label="Best streak" value={profile.best_streak} />
       </View>
-      <Pressable style={styles.button} onPress={() => signOut()}>
-        <Text style={styles.buttonText}>Sign out</Text>
-      </Pressable>
-    </View>
+
+      <View style={styles.spacer} />
+      <Button title="Sign out" variant="quiet" onPress={() => signOut()} />
+    </Screen>
   );
 }
 
 function Stat({ label, value }: { label: string; value: string | number }) {
   return (
-    <View style={styles.stat}>
+    <Card style={styles.stat}>
       <Text style={styles.statValue}>{value}</Text>
       <Text style={styles.statLabel}>{label}</Text>
-    </View>
+    </Card>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, padding: 24, backgroundColor: colors.background },
-  center: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.background },
-  username: { fontSize: 24, fontWeight: '700', color: colors.text, marginBottom: 24 },
-  statsRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 16 },
-  stat: { alignItems: 'center', flex: 1 },
-  statValue: { fontSize: 20, fontWeight: '700', color: colors.primary },
-  statLabel: { color: colors.textMuted, marginTop: 4, fontSize: 12 },
-  button: { marginTop: 24, backgroundColor: colors.wrong, borderRadius: 8, padding: 14, alignItems: 'center' },
-  buttonText: { color: colors.onPrimary, fontWeight: '700' },
-  error: { color: colors.wrong },
+  center: { alignItems: 'center', justifyContent: 'center' },
+  playerCard: { alignItems: 'center', gap: spacing.sm, marginBottom: spacing.lg },
+  avatar: {
+    width: 64,
+    height: 64,
+    borderRadius: radii.pill,
+    backgroundColor: colors.accentSoft,
+    borderWidth: 1.5,
+    borderColor: colors.accent,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  avatarText: { fontSize: 28, fontWeight: '900', color: colors.accentPressed },
+  username: { ...type.title },
+  statsGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: spacing.md,
+  },
+  stat: {
+    flexBasis: '30%',
+    flexGrow: 1,
+    alignItems: 'center',
+    padding: spacing.md,
+    gap: spacing.xs,
+  },
+  statValue: { fontSize: 22, fontWeight: '900', color: colors.primary },
+  statLabel: { ...type.caption, fontWeight: '700' },
+  spacer: { flex: 1 },
+  error: { ...type.body, color: colors.danger },
 });

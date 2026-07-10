@@ -1,27 +1,34 @@
+import { colors as theme } from '@/ui/theme';
+
+/**
+ * @deprecated Legacy palette names, re-pointed at the board-game theme
+ * (`src/ui/theme.ts`) so unmigrated screens pick up the new look. Issues 13–16
+ * move each screen onto the semantic tokens directly; delete this when the
+ * last screen migrates. `typeColors` below is content, not chrome — it stays.
+ */
 export const colors = {
-  primary: '#3CA0E1',
-  primaryDark: '#2B84BD',
-  primaryBg: '#E8F4FC',
-  accent: '#FFCB38',
-  accentDark: '#E5A800',
-  accentBg: '#FFF8E1',
-  secondary: '#FF8F5C',
-  background: '#F0F7FD',
-  card: '#FFFFFF',
-  text: '#1A2840',
-  textMuted: '#5B7A99',
-  border: '#D6E8F5',
-  correct: '#34C759',
-  correctBg: '#E8F9ED',
-  wrong: '#FF5757',
-  wrongBg: '#FFECEC',
-  selected: '#3CA0E1',
-  selectedBg: '#D6EBFA',
-  gold: '#FFCB38',
-  onPrimary: '#FFFFFF',
-  onAccent: '#1A2840',
+  primary: theme.primary,
+  primaryDark: theme.primaryPressed,
+  primaryBg: theme.primarySoft,
+  accent: theme.accent,
+  accentDark: theme.accentPressed,
+  accentBg: theme.accentSoft,
+  background: theme.background,
+  card: theme.surface,
+  text: theme.ink,
+  textMuted: theme.inkMuted,
+  border: theme.border,
+  correct: theme.success,
+  correctBg: theme.successSoft,
+  wrong: theme.danger,
+  wrongBg: theme.dangerSoft,
+  selected: theme.primary,
+  selectedBg: theme.primarySoft,
+  onPrimary: theme.onPrimary,
+  onAccent: theme.onAccent,
 } as const;
 
+/** Official Pokémon type colors — content, permanently exempt from theming. */
 export const typeColors: Record<string, string> = {
   normal: '#A8A77A',
   fire: '#EE8130',

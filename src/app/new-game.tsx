@@ -1,17 +1,10 @@
 import { useRouter } from 'expo-router';
 import { useState } from 'react';
-import {
-  ActivityIndicator,
-  Pressable,
-  StyleSheet,
-  Text,
-  TextInput,
-  View,
-} from 'react-native';
+import { StyleSheet, Text, View } from 'react-native';
 
-import { colors } from '@/constants/colors';
 import { createParty, joinParty } from '@/lib/matches';
 import { useSupabase } from '@/lib/supabase';
+import { Button, Card, Screen, TextField, colors, spacing, type } from '@/ui';
 
 export default function NewGameScreen() {
   const supabase = useSupabase();
@@ -51,89 +44,58 @@ export default function NewGameScreen() {
   const disabled = busy !== null;
 
   return (
-    <View style={styles.container}>
-      <Text style={styles.sectionTitle}>Start a party</Text>
-      <Text style={styles.help}>Create a private game and share the code with a friend.</Text>
-      <Pressable
-        style={[styles.button, disabled && styles.buttonDisabled]}
-        onPress={onCreate}
-        disabled={disabled}>
-        {busy === 'create' ? (
-          <ActivityIndicator color={colors.onPrimary} />
-        ) : (
-          <Text style={styles.buttonText}>Start a party</Text>
-        )}
-      </Pressable>
+    <Screen>
+      <Card style={styles.section}>
+        <Text style={styles.sectionTitle}>Play a friend</Text>
+        <Text style={styles.help}>Create a private game and share the code with a friend.</Text>
+        <Button
+          title="Start a party"
+          onPress={onCreate}
+          busy={busy === 'create'}
+          disabled={disabled}
+        />
+        <View style={styles.divider} />
+        <Text style={styles.help}>Or enter the code a friend shared with you.</Text>
+        <TextField
+          style={styles.codeInput}
+          placeholder="PARTY CODE"
+          autoCapitalize="characters"
+          autoCorrect={false}
+          maxLength={6}
+          value={code}
+          onChangeText={(t) => setCode(t.toUpperCase())}
+          editable={!disabled}
+        />
+        <Button
+          title="Join party"
+          variant="secondary"
+          onPress={onJoin}
+          busy={busy === 'join'}
+          disabled={disabled}
+        />
+      </Card>
 
-      <View style={styles.divider} />
-
-      <Text style={styles.sectionTitle}>Join a party</Text>
-      <Text style={styles.help}>Enter the code a friend shared with you.</Text>
-      <TextInput
-        style={styles.input}
-        placeholder="Party code"
-        autoCapitalize="characters"
-        autoCorrect={false}
-        maxLength={6}
-        value={code}
-        onChangeText={(t) => setCode(t.toUpperCase())}
-        editable={!disabled}
-      />
-      <Pressable
-        style={[styles.buttonSecondary, disabled && styles.buttonDisabled]}
-        onPress={onJoin}
-        disabled={disabled}>
-        {busy === 'join' ? (
-          <ActivityIndicator color={colors.primary} />
-        ) : (
-          <Text style={styles.buttonSecondaryText}>Join party</Text>
-        )}
-      </Pressable>
+      <Card style={styles.section}>
+        <Text style={styles.sectionTitle}>Random opponent</Text>
+        <Text style={styles.help}>Get matched with the longest-waiting player.</Text>
+        <Button
+          title="Find a random game"
+          variant="accent"
+          onPress={() => router.replace('/matchmaking')}
+          disabled={disabled}
+        />
+      </Card>
 
       {error && <Text style={styles.error}>{error}</Text>}
-
-      <View style={styles.divider} />
-
-      <Text style={styles.sectionTitle}>Random game</Text>
-      <Text style={styles.help}>Get matched with the longest-waiting player.</Text>
-      <Pressable
-        style={[styles.buttonSecondary, disabled && styles.buttonDisabled]}
-        onPress={() => router.replace('/matchmaking')}
-        disabled={disabled}>
-        <Text style={styles.buttonSecondaryText}>Find a random game</Text>
-      </Pressable>
-    </View>
+    </Screen>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, padding: 24, backgroundColor: colors.background },
-  sectionTitle: { fontSize: 18, fontWeight: '700', color: colors.text },
-  help: { color: colors.textMuted, marginTop: 4, marginBottom: 12 },
-  button: { backgroundColor: colors.primary, borderRadius: 12, padding: 16, alignItems: 'center' },
-  buttonText: { color: colors.onPrimary, fontWeight: '700', fontSize: 16 },
-  buttonSecondary: {
-    borderWidth: 1.5,
-    borderColor: colors.primary,
-    borderRadius: 12,
-    padding: 15,
-    alignItems: 'center',
-  },
-  buttonSecondaryText: { color: colors.primary, fontWeight: '700', fontSize: 16 },
-  buttonDisabled: { opacity: 0.6 },
-  input: {
-    borderWidth: 1,
-    borderColor: colors.border,
-    backgroundColor: colors.card,
-    borderRadius: 8,
-    padding: 12,
-    marginBottom: 12,
-    fontSize: 18,
-    letterSpacing: 4,
-    textAlign: 'center',
-    fontWeight: '700',
-    color: colors.text,
-  },
-  divider: { height: 1, backgroundColor: colors.border, marginVertical: 24 },
-  error: { color: colors.wrong, marginTop: 16, textAlign: 'center' },
+  section: { marginBottom: spacing.lg, gap: spacing.md },
+  sectionTitle: { ...type.title },
+  help: { ...type.body, color: colors.inkMuted },
+  divider: { height: 1.5, backgroundColor: colors.border, marginVertical: spacing.xs },
+  codeInput: { textAlign: 'center', letterSpacing: 4, fontWeight: '800', fontSize: 18 },
+  error: { ...type.body, color: colors.danger, textAlign: 'center', marginTop: spacing.sm },
 });
