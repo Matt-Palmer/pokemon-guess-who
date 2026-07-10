@@ -1,21 +1,21 @@
 import { useUser } from '@clerk/clerk-expo';
 import { Image } from 'expo-image';
 import { useLocalSearchParams } from 'expo-router';
-import { useEffect, useMemo, useRef, useState } from 'react';
-import {
-  ActivityIndicator,
-  Alert,
-  Pressable,
-  ScrollView,
-  StyleSheet,
-  Text,
-  TextInput,
-  View,
-} from 'react-native';
+import { ReactNode, useEffect, useMemo, useRef, useState } from 'react';
+import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import Animated, {
+  useAnimatedStyle,
+  useSharedValue,
+  withRepeat,
+  withSequence,
+  withTiming,
+} from 'react-native-reanimated';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { colors, typeColors } from '@/constants/colors';
+import { typeColors } from '@/constants/colors';
 import { claimState, formatRemaining } from '@/lib/game/claim';
 import { pairThread, splitByMarks } from '@/lib/game/review';
+import { summarizeTurn } from '@/lib/game/summary';
 import {
   answerQuestion,
   askQuestion,
@@ -33,11 +33,133 @@ import {
   useMySecret,
 } from '@/lib/matches';
 import { useSupabase } from '@/lib/supabase';
+import { Badge, Button, CardModal, Screen, TextField, colors, radii, shadows, spacing, type } from '@/ui';
+
+const BOARD_COLUMNS = 4;
+
+/** Pokémon names arrive lowercase; tiles capitalize via CSS, prose can't. */
+const displayName = (name: string) => name.charAt(0).toUpperCase() + name.slice(1);
+
+const AnimatedPressable = Animated.createAnimatedComponent(Pressable);
+
+/**
+ * The floating entry to the thread (see ADR 0001): pulses while the game
+ * waits on the player (owe an answer / your move to ask), shows a dot for
+ * unread opponent activity, stays quiet otherwise.
+ */
+function ChatBubble({
+  pulse,
+  dot,
+  bottom,
+  onPress,
+}: {
+  pulse: boolean;
+  dot: boolean;
+  bottom: number;
+  onPress: () => void;
+}) {
+  const t = useSharedValue(0);
+  useEffect(() => {
+    t.value = pulse
+      ? withRepeat(withSequence(withTiming(1, { duration: 500 }), withTiming(0, { duration: 500 })), -1)
+      : withTiming(0, { duration: 200 });
+  }, [pulse, t]);
+  const pulseStyle = useAnimatedStyle(() => ({ transform: [{ scale: 1 + t.value * 0.1 }] }));
+
+  return (
+    <AnimatedPressable
+      style={[styles.bubble, { bottom }, pulseStyle]}
+      onPress={onPress}
+      accessibilityLabel="Open the question thread">
+      <Text style={styles.bubbleIcon}>💬</Text>
+      {dot && <View style={styles.bubbleDot} />}
+    </AnimatedPressable>
+  );
+}
+
+/** Slim always-visible phase + whose-move indicator; resign/review live here. */
+function TurnStrip({
+  phaseLabel,
+  myMove,
+  text,
+  hint,
+  onReview,
+  onResign,
+  resignDisabled,
+}: {
+  phaseLabel: string;
+  myMove: boolean;
+  text: string;
+  hint?: string;
+  onReview?: () => void;
+  onResign?: () => void;
+  resignDisabled?: boolean;
+}) {
+  return (
+    <View style={styles.strip}>
+      <Badge label={phaseLabel} variant={myMove ? 'accent' : 'neutral'} />
+      <View style={styles.stripBody}>
+        <Text style={styles.stripText} numberOfLines={1}>
+          {text}
+        </Text>
+        {hint ? (
+          <Text style={styles.stripHint} numberOfLines={1}>
+            {hint}
+          </Text>
+        ) : null}
+      </View>
+      {onReview && (
+        <Pressable hitSlop={8} onPress={onReview}>
+          <Text style={styles.stripReview}>Review</Text>
+        </Pressable>
+      )}
+      {onResign && (
+        <Pressable hitSlop={8} disabled={resignDisabled} onPress={onResign}>
+          <Text style={styles.stripResign}>Resign</Text>
+        </Pressable>
+      )}
+    </View>
+  );
+}
+
+/** The board: 24 tiles in fixed rows that share the viewport — never scrolls. */
+function BoardGrid({
+  cards,
+  renderTile,
+}: {
+  cards: PokemonCard[];
+  renderTile: (card: PokemonCard) => ReactNode;
+}) {
+  const rows = useMemo(() => {
+    const out: PokemonCard[][] = [];
+    for (let i = 0; i < cards.length; i += BOARD_COLUMNS) out.push(cards.slice(i, i + BOARD_COLUMNS));
+    return out;
+  }, [cards]);
+
+  if (cards.length === 0) {
+    return (
+      <View style={styles.boardLoading}>
+        <ActivityIndicator color={colors.primary} />
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.board}>
+      {rows.map((row, i) => (
+        <View key={i} style={styles.boardRow}>
+          {row.map(renderTile)}
+        </View>
+      ))}
+    </View>
+  );
+}
 
 export default function MatchScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const { user } = useUser();
   const supabase = useSupabase();
+  const insets = useSafeAreaInsets();
   const { match, loading, error, refetch } = useMatch(id);
   const cards = useBoardPokemon(match?.board);
   const { secret: mySecretId, refetch: refetchSecret } = useMySecret(id);
@@ -56,6 +178,7 @@ export default function MatchScreen() {
   const [guessing, setGuessing] = useState(false);
   const [guessFeedback, setGuessFeedback] = useState<string | null>(null);
   const [reviewOpen, setReviewOpen] = useState(false);
+  const [chatOpen, setChatOpen] = useState(false);
   const [ending, setEnding] = useState(false);
   const threadRef = useRef<ScrollView>(null);
 
@@ -73,17 +196,64 @@ export default function MatchScreen() {
   const review = useMemo(() => splitByMarks(cards, marks), [cards, marks]);
   const qaHistory = useMemo(() => pairThread(events), [events]);
 
+  const turn = match && user ? summarizeTurn(match, user.id) : null;
+  const iAsk = turn?.kind === 'your_question';
+  const iAnswer = turn?.kind === 'your_answer';
+
+  // The chat modal auto-presents only when it becomes the player's move to
+  // answer — on entering the screen or live when the question arrives. Your
+  // turn to ask never auto-opens; the bubble pulses instead (ADR 0001).
+  const wasAnswering = useRef(false);
+  useEffect(() => {
+    if (iAnswer && !wasAnswering.current) setChatOpen(true);
+    wasAnswering.current = iAnswer;
+  }, [iAnswer]);
+
+  // Unread tracking for the bubble's dot: the first loaded batch is history,
+  // not news — only events arriving after that (while the modal is closed)
+  // count as unread.
+  const [seenEvents, setSeenEvents] = useState(0);
+  const eventsBaselined = useRef(false);
+  useEffect(() => {
+    if (chatOpen || !eventsBaselined.current) {
+      setSeenEvents(events.length);
+      if (chatOpen || events.length > 0) eventsBaselined.current = true;
+    }
+  }, [chatOpen, events.length]);
+  const lastEvent = events.length > 0 ? events[events.length - 1] : null;
+  const hasUnread = events.length > seenEvents && lastEvent?.author_id !== user?.id;
+
   const mySlot = match ? (match.player1_id === user?.id ? 'player1' : 'player2') : null;
   const bothDrawn = Boolean(match?.player1_drawn && match?.player2_drawn);
   const myDrawn = mySlot === 'player1' ? match?.player1_drawn : match?.player2_drawn;
-  // Player 1 draws first, then player 2.
-  const drawTurn = match ? (!match.player1_drawn ? 'player1' : 'player2') : null;
-  const isMyTurnToDraw = !bothDrawn && !myDrawn && drawTurn === mySlot;
 
   const mySecretCard = useMemo(
     () => cards.find((c) => c.id === mySecretId) ?? null,
     [cards, mySecretId],
   );
+
+  if (loading) {
+    return (
+      <Screen style={styles.center}>
+        <ActivityIndicator color={colors.primary} />
+      </Screen>
+    );
+  }
+
+  if (error || !match || !turn) {
+    return (
+      <Screen style={styles.center}>
+        <Text style={styles.error}>{error ?? 'Game not found.'}</Text>
+      </Screen>
+    );
+  }
+
+  const oppSlot = mySlot === 'player1' ? 'player2' : 'player1';
+  const nameFor = (slot: 'player1' | 'player2', fallback: string) => {
+    const cid = slot === 'player1' ? match.player1_id : match.player2_id;
+    return (cid && players[cid]?.username) || fallback;
+  };
+  const oppName = nameFor(oppSlot, 'your opponent');
 
   const onDraw = async (card: PokemonCard) => {
     if (!id || drawing) return;
@@ -139,7 +309,7 @@ export default function MatchScreen() {
     }
   };
 
-  // In guess mode a tap picks the card to guess (confirmed separately) rather
+  // In guess mode a tap picks the tile to guess (confirmed separately) rather
   // than crossing it off, so a guess is never triggered by a stray tap.
   const onCardPress = (card: PokemonCard) => {
     if (guessMode) setGuessTarget(card);
@@ -150,6 +320,7 @@ export default function MatchScreen() {
     setTurnError(null);
     setGuessFeedback(null);
     setGuessTarget(null);
+    setChatOpen(false);
     setGuessMode(true);
   };
 
@@ -169,7 +340,7 @@ export default function MatchScreen() {
       // end screen takes over. On a wrong guess the server auto-crosses the
       // missed card (arriving via the board_marks stream) and passes the turn.
       if (!res.correct) {
-        setGuessFeedback(`Not ${guessTarget.name}. Your turn is over.`);
+        setGuessFeedback(`Not ${displayName(guessTarget.name)}. Your turn is over.`);
       }
       setGuessTarget(null);
       setGuessMode(false);
@@ -179,29 +350,6 @@ export default function MatchScreen() {
       setGuessing(false);
     }
   };
-
-  if (loading) {
-    return (
-      <View style={styles.center}>
-        <ActivityIndicator color={colors.primary} />
-      </View>
-    );
-  }
-
-  if (error || !match) {
-    return (
-      <View style={styles.center}>
-        <Text style={styles.error}>{error ?? 'Game not found.'}</Text>
-      </View>
-    );
-  }
-
-  const oppSlot = mySlot === 'player1' ? 'player2' : 'player1';
-  const nameFor = (slot: 'player1' | 'player2', fallback: string) => {
-    const cid = slot === 'player1' ? match.player1_id : match.player2_id;
-    return (cid && players[cid]?.username) || fallback;
-  };
-  const oppName = nameFor(oppSlot, 'your opponent');
 
   // ── Resign & inactivity claim: both end the game via server RPCs; the ──
   // ── screen refetches on success so it never waits on Realtime.        ──
@@ -255,39 +403,42 @@ export default function MatchScreen() {
     : ({ kind: 'not_applicable' } as const);
   const claimUi =
     claim.kind === 'claimable' ? (
-      <Pressable style={styles.claimBtn} disabled={ending} onPress={onClaim}>
-        <Text style={styles.claimBtnText}>
-          {oppName} hasn’t moved in 7 days — claim the win
-        </Text>
-      </Pressable>
+      <View style={styles.claimWrap}>
+        <Button
+          title={`${oppName} hasn’t moved in 7 days — claim the win`}
+          variant="accent"
+          disabled={ending}
+          onPress={onClaim}
+        />
+      </View>
     ) : claim.kind === 'countdown' ? (
       <Text style={styles.claimCountdown}>
         No move from {oppName}? You can claim the win in {formatRemaining(claim.remainingMs)}.
       </Text>
     ) : null;
 
-  // ── Blind-draw phase: cards face-down until both players have drawn. ──
+  // ── Blind-draw phase: tiles face-down until both players have drawn. ──
   if (!bothDrawn) {
-    const banner = isMyTurnToDraw
-      ? 'Tap a face-down card to draw your secret'
-      : myDrawn
-        ? 'Waiting for your opponent to draw…'
-        : drawTurn === 'player1'
-          ? 'Waiting for player 1 to draw…'
-          : 'Waiting for your opponent to draw…';
+    const stripText =
+      turn.kind === 'your_draw'
+        ? 'Your draw'
+        : myDrawn
+          ? `Waiting for ${oppName}…`
+          : `Waiting for ${nameFor('player1', 'player 1')}…`;
 
     return (
-      <View style={styles.container}>
-        <View style={styles.drawHeader}>
-          <Text style={styles.drawTitle}>Blind draw</Text>
-          <Text style={styles.drawBanner}>{banner}</Text>
-          {drawError && <Text style={styles.error}>{drawError}</Text>}
-          {turnError && <Text style={styles.error}>{turnError}</Text>}
-          {claimUi}
-          <Pressable style={styles.drawResign} hitSlop={8} disabled={ending} onPress={onResign}>
-            <Text style={styles.resignText}>Resign</Text>
-          </Pressable>
-        </View>
+      <Screen padded={false} style={{ paddingBottom: insets.bottom }}>
+        <TurnStrip
+          phaseLabel="Blind draw"
+          myMove={turn.kind === 'your_draw'}
+          text={stripText}
+          hint={turn.kind === 'your_draw' ? 'Tap a face-down tile to draw' : 'Each player draws a secret'}
+          onResign={onResign}
+          resignDisabled={ending}
+        />
+        {drawError && <Text style={styles.error}>{drawError}</Text>}
+        {turnError && <Text style={styles.error}>{turnError}</Text>}
+        {claimUi}
 
         {myDrawn && (
           <View style={styles.secretBanner}>
@@ -307,22 +458,22 @@ export default function MatchScreen() {
           </View>
         )}
 
-        <ScrollView contentContainerStyle={styles.grid}>
-          {cards.map((card) => {
+        <BoardGrid
+          cards={cards}
+          renderTile={(card) => {
             const isMine = card.id === mySecretId;
             return (
               <Pressable
                 key={card.id}
-                style={[styles.card, styles.cardBack, isMine && styles.cardMineBack]}
-                disabled={!isMyTurnToDraw || drawing}
+                style={[styles.tile, styles.tileBack, isMine && styles.tileMineBack]}
+                disabled={turn.kind !== 'your_draw' || drawing}
                 onPress={() => onDraw(card)}>
-                <Text style={styles.cardBackMark}>{isMine ? '★' : '?'}</Text>
+                <Text style={styles.tileBackMark}>{isMine ? '★' : '?'}</Text>
               </Pressable>
             );
-          })}
-          {cards.length === 0 && <Text style={styles.loadingBoard}>Loading board…</Text>}
-        </ScrollView>
-      </View>
+          }}
+        />
+      </Screen>
     );
   }
 
@@ -366,77 +517,86 @@ export default function MatchScreen() {
           : `${oppName} guessed your secret.`;
 
     return (
-      <View style={styles.container}>
-        <View style={styles.endPanel}>
-          <Text style={[styles.endTitle, didIWin ? styles.endWin : styles.endLose]}>
-            {didIWin ? 'You won! 🎉' : 'You lost'}
-          </Text>
-          <Text style={styles.endSubtitle}>{endSubtitle}</Text>
-          <View style={styles.revealRow}>
-            <RevealCard label={`${oppName}'s secret`} card={oppSecretCard} />
-            <RevealCard label="Your secret" card={mySecretRevealCard} />
-          </View>
+      <Screen style={styles.endPanel}>
+        <Text style={[styles.endTitle, didIWin ? styles.endWin : styles.endLose]}>
+          {didIWin ? 'You won! 🎉' : 'You lost'}
+        </Text>
+        <Text style={styles.endSubtitle}>{endSubtitle}</Text>
+        <View style={styles.revealRow}>
+          <RevealCard label={`${oppName}'s secret`} card={oppSecretCard} />
+          <RevealCard label="Your secret" card={mySecretRevealCard} />
         </View>
-      </View>
+      </Screen>
     );
   }
 
-  // ── Active play: turn loop of questions & answers over a face-up board. ──
-  const isMyTurn = match.current_player === mySlot;
-  const iAsk = match.phase === 'awaiting_question' && isMyTurn;
-  // The answerer is the opponent of the asker (current_player).
-  const iAnswer = match.phase === 'awaiting_answer' && match.current_player !== mySlot;
-
-  const banner =
-    match.phase === 'awaiting_question'
-      ? isMyTurn
-        ? 'Your turn — ask a question'
-        : `${oppName}'s turn to ask…`
-      : iAnswer
+  // ── Active play: the board owns the viewport; the thread lives behind ──
+  // ── the chat bubble → chat modal (ADR 0001). Guessing stays on-board. ──
+  const stripText = guessMode
+    ? 'Tap their secret tile'
+    : turn.kind === 'your_question'
+      ? 'Your move'
+      : turn.kind === 'your_answer'
         ? 'Answer the question'
-        : `Waiting for ${oppName} to answer…`;
+        : turn.kind === 'their_answer'
+          ? `${oppName} is answering…`
+          : `${oppName}'s move…`;
+
+  // First-match orientation: until a question exists, say how the game works.
+  const stripHint = guessMode
+    ? 'A wrong guess costs your turn'
+    : turn.kind === 'your_question'
+      ? events.length === 0
+        ? 'Ask with 💬 · cross off tiles'
+        : 'Ask with 💬 or make a guess'
+      : undefined;
 
   return (
-    <View style={styles.container}>
-      <View style={[styles.turnBanner, guessMode && styles.turnBannerGuess]}>
-        <Text style={styles.turnText}>
-          {guessMode ? 'Tap the card you think is their secret' : banner}
-        </Text>
-        <Text style={styles.turnHint}>
-          {guessMode
-            ? 'A wrong guess costs you your turn · long-press for details'
-            : 'Tap a card to cross it off · long-press for details'}
-        </Text>
-        <Pressable style={styles.reviewBtn} hitSlop={8} onPress={() => setReviewOpen(true)}>
-          <Text style={styles.reviewBtnText}>Review</Text>
-        </Pressable>
-        <Pressable style={styles.resignBtn} hitSlop={8} disabled={ending} onPress={onResign}>
-          <Text style={styles.resignText}>Resign</Text>
-        </Pressable>
-      </View>
+    <Screen padded={false} style={{ paddingBottom: insets.bottom }}>
+      <TurnStrip
+        phaseLabel={guessMode ? 'Guess' : 'Questions'}
+        myMove={Boolean(turn.myMove) || guessMode}
+        text={stripText}
+        hint={stripHint}
+        onReview={() => setReviewOpen(true)}
+        onResign={onResign}
+        resignDisabled={ending}
+      />
 
-      <ScrollView style={styles.board} contentContainerStyle={styles.grid}>
-        {cards.map((card) => {
+      {turnError && <Text style={styles.error}>{turnError}</Text>}
+      {guessFeedback && (
+        // After a wrong guess the review panel is one tap away, so the player
+        // can regroup over their cross-offs and Q/A history.
+        <View style={styles.guessFeedback}>
+          <Text style={styles.guessFeedbackText}>{guessFeedback}</Text>
+          <Pressable hitSlop={8} onPress={() => setReviewOpen(true)}>
+            <Text style={styles.guessFeedbackLink}>Review your clues</Text>
+          </Pressable>
+        </View>
+      )}
+      {!guessMode && claimUi}
+
+      <BoardGrid
+        cards={cards}
+        renderTile={(card) => {
           const crossed = marks.has(card.id);
           const isGuessTarget = guessTarget?.id === card.id;
           return (
             <Pressable
               key={card.id}
               style={[
-                styles.card,
-                card.id === mySecretId && styles.cardMine,
-                isGuessTarget && styles.cardGuessTarget,
+                styles.tile,
+                card.id === mySecretId && styles.tileMine,
+                isGuessTarget && styles.tileGuessTarget,
               ]}
               onPress={() => onCardPress(card)}
               onLongPress={() => setSelected(card)}>
               <Image
                 source={{ uri: card.sprite_url }}
-                style={[styles.sprite, crossed && styles.spriteCrossed]}
+                style={[styles.tileSprite, crossed && styles.tileSpriteCrossed]}
                 contentFit="contain"
               />
-              <Text
-                style={[styles.name, crossed && styles.nameCrossed]}
-                numberOfLines={1}>
+              <Text style={[styles.tileName, crossed && styles.tileNameCrossed]} numberOfLines={1}>
                 {card.name}
               </Text>
               {crossed && (
@@ -446,18 +606,54 @@ export default function MatchScreen() {
               )}
             </Pressable>
           );
-        })}
-        {cards.length === 0 && <Text style={styles.loadingBoard}>Loading board…</Text>}
-      </ScrollView>
+        }}
+      />
 
-      <View style={styles.threadPanel}>
+      {guessMode && (
+        // Guess confirm bar: the one flow that stays on the board.
+        <View style={styles.guessBar}>
+          <Button
+            title="Cancel"
+            variant="secondary"
+            disabled={guessing}
+            onPress={cancelGuess}
+            style={styles.guessCancel}
+          />
+          <Button
+            title={guessTarget ? `Guess ${displayName(guessTarget.name)}` : 'Pick a tile'}
+            disabled={!guessTarget}
+            busy={guessing}
+            onPress={onConfirmGuess}
+            style={styles.guessConfirm}
+          />
+        </View>
+      )}
+
+      {!guessMode && (
+        <ChatBubble
+          pulse={iAsk || iAnswer}
+          dot={iAsk || iAnswer || hasUnread}
+          bottom={insets.bottom + spacing.lg}
+          onPress={() => setChatOpen(true)}
+        />
+      )}
+
+      {/* Chat modal: the thread + composition, over the dimmed board. The
+          draft lives in screen state, so dismissing to peek at the board and
+          reopening never loses a composed question or answer. */}
+      <CardModal
+        visible={chatOpen}
+        onClose={() => setChatOpen(false)}
+        title="Questions & answers">
         <ScrollView
           ref={threadRef}
           style={styles.thread}
           contentContainerStyle={styles.threadContent}
           onContentSizeChange={() => threadRef.current?.scrollToEnd({ animated: true })}>
           {events.length === 0 && (
-            <Text style={styles.threadEmpty}>No questions asked yet.</Text>
+            <Text style={styles.threadEmpty}>
+              No questions yet. Ask anything with a yes/no answer.
+            </Text>
           )}
           {events.map((ev) => {
             const mine = ev.author_id === user?.id;
@@ -467,512 +663,369 @@ export default function MatchScreen() {
                 <Text style={styles.eventMeta}>
                   {author} · {ev.kind === 'question' ? 'asked' : 'answered'}
                 </Text>
-                <Text style={[styles.eventBody, ev.kind === 'answer' && styles.eventAnswer]}>
-                  {ev.body}
-                </Text>
+                <View style={[styles.eventBubble, mine && styles.eventBubbleMine]}>
+                  <Text style={[styles.eventBody, ev.kind === 'answer' && styles.eventAnswer]}>
+                    {ev.body}
+                  </Text>
+                </View>
               </View>
             );
           })}
         </ScrollView>
 
         {turnError && <Text style={styles.error}>{turnError}</Text>}
-        {guessFeedback && (
-          // After a wrong guess the review panel is one tap away, so the player
-          // can regroup over their cross-offs and Q/A history.
-          <View style={styles.guessFeedback}>
-            <Text style={styles.guessFeedbackText}>{guessFeedback}</Text>
-            <Pressable hitSlop={8} onPress={() => setReviewOpen(true)}>
-              <Text style={styles.guessFeedbackLink}>Review your clues</Text>
-            </Pressable>
+
+        {iAnswer && (
+          <View style={styles.quickRow}>
+            <Button
+              title="Yes"
+              variant="accent"
+              disabled={sending}
+              onPress={() => sendAnswer('Yes')}
+              style={styles.quickBtn}
+            />
+            <Button
+              title="No"
+              variant="accent"
+              disabled={sending}
+              onPress={() => sendAnswer('No')}
+              style={styles.quickBtn}
+            />
           </View>
         )}
 
-        {guessMode ? (
-          // Guess controls take over the input area while a guess is being made.
-          <View style={styles.guessBar}>
-            <Pressable style={styles.guessCancelBtn} disabled={guessing} onPress={cancelGuess}>
-              <Text style={styles.guessCancelText}>Cancel</Text>
-            </Pressable>
-            <Pressable
-              style={[
-                styles.guessConfirmBtn,
-                (guessing || !guessTarget) && styles.sendBtnDisabled,
-              ]}
-              disabled={guessing || !guessTarget}
-              onPress={onConfirmGuess}>
-              <Text style={styles.sendText}>
-                {guessTarget ? `Guess ${guessTarget.name}` : 'Pick a card'}
-              </Text>
-            </Pressable>
+        {iAsk || iAnswer ? (
+          <View style={styles.inputRow}>
+            <TextField
+              style={styles.input}
+              value={input}
+              onChangeText={setInput}
+              placeholder={iAsk ? 'Ask a yes/no question…' : 'Type your answer…'}
+              editable={!sending}
+              onSubmitEditing={onSend}
+              returnKeyType="send"
+            />
+            <Button title="Send" busy={sending} disabled={!input.trim()} onPress={onSend} />
           </View>
         ) : (
-          <>
-            {iAnswer && (
-              <View style={styles.quickRow}>
-                <Pressable
-                  style={[styles.quickBtn, sending && styles.sendBtnDisabled]}
-                  disabled={sending}
-                  onPress={() => sendAnswer('Yes')}>
-                  <Text style={styles.quickText}>Yes</Text>
-                </Pressable>
-                <Pressable
-                  style={[styles.quickBtn, sending && styles.sendBtnDisabled]}
-                  disabled={sending}
-                  onPress={() => sendAnswer('No')}>
-                  <Text style={styles.quickText}>No</Text>
-                </Pressable>
-              </View>
-            )}
-
-            {iAsk || iAnswer ? (
-              <View style={styles.inputRow}>
-                <TextInput
-                  style={styles.input}
-                  value={input}
-                  onChangeText={setInput}
-                  placeholder={iAsk ? 'Ask a yes/no question…' : 'Type your answer…'}
-                  placeholderTextColor={colors.textMuted}
-                  editable={!sending}
-                  onSubmitEditing={onSend}
-                  returnKeyType="send"
-                />
-                <Pressable
-                  style={[styles.sendBtn, (sending || !input.trim()) && styles.sendBtnDisabled]}
-                  disabled={sending || !input.trim()}
-                  onPress={onSend}>
-                  <Text style={styles.sendText}>Send</Text>
-                </Pressable>
-              </View>
-            ) : (
-              <>
-                <Text style={styles.waitingHint}>
-                  {match.phase === 'awaiting_answer'
-                    ? `Waiting for ${oppName} to answer…`
-                    : `Waiting for ${oppName}…`}
-                </Text>
-                {claimUi}
-              </>
-            )}
-
-            {/* On your turn you may ask a question XOR make a guess. */}
-            {iAsk && (
-              <Pressable style={styles.guessStartBtn} onPress={enterGuessMode}>
-                <Text style={styles.guessStartText}>Make a guess instead</Text>
-              </Pressable>
-            )}
-          </>
+          <Text style={styles.waitingHint}>
+            {turn.kind === 'their_answer'
+              ? `Waiting for ${oppName} to answer…`
+              : `Waiting for ${oppName}…`}
+          </Text>
         )}
-      </View>
 
-      {reviewOpen && (
-        <>
-          <Pressable
-            style={styles.detailBackdrop}
-            onPress={() => setReviewOpen(false)}
-            accessibilityLabel="Close review"
+        {/* On your turn you may ask a question XOR make a guess. */}
+        {iAsk && (
+          <Button
+            title="Make a guess instead"
+            variant="secondary"
+            onPress={enterGuessMode}
+            style={styles.guessStart}
           />
-          <View style={styles.reviewPanel}>
-            <View style={styles.reviewHeader}>
-              <Text style={styles.reviewTitle}>Review</Text>
-              <Text style={styles.reviewSummary}>
-                {review.crossedOff.length} crossed off · {review.remaining.length} remaining
-              </Text>
-              <Pressable
-                style={styles.detailClose}
-                hitSlop={16}
-                onPress={() => setReviewOpen(false)}>
-                <Text style={styles.detailCloseText}>✕</Text>
-              </Pressable>
-            </View>
-            <ScrollView contentContainerStyle={styles.reviewContent}>
-              <Text style={styles.reviewSection}>Your crossed-off cards</Text>
-              {review.crossedOff.length === 0 ? (
-                <Text style={styles.reviewEmpty}>Nothing crossed off yet.</Text>
-              ) : (
-                <View style={styles.reviewGrid}>
-                  {review.crossedOff.map((card) => (
-                    <View key={card.id} style={styles.reviewCard}>
-                      <Image
-                        source={{ uri: card.sprite_url }}
-                        style={styles.reviewSprite}
-                        contentFit="contain"
-                      />
-                      <Text style={styles.reviewCardName} numberOfLines={1}>
-                        {card.name}
-                      </Text>
-                    </View>
-                  ))}
+        )}
+      </CardModal>
+
+      {/* Review: own cross-offs + the paired Q/A history. */}
+      <CardModal visible={reviewOpen} onClose={() => setReviewOpen(false)} title="Review">
+        <Text style={styles.reviewSummary}>
+          {review.crossedOff.length} crossed off · {review.remaining.length} remaining
+        </Text>
+        <ScrollView style={styles.reviewScroll} contentContainerStyle={styles.reviewContent}>
+          <Text style={styles.reviewSection}>Your crossed-off tiles</Text>
+          {review.crossedOff.length === 0 ? (
+            <Text style={styles.reviewEmpty}>Nothing crossed off yet.</Text>
+          ) : (
+            <View style={styles.reviewGrid}>
+              {review.crossedOff.map((card) => (
+                <View key={card.id} style={styles.reviewCard}>
+                  <Image
+                    source={{ uri: card.sprite_url }}
+                    style={styles.reviewSprite}
+                    contentFit="contain"
+                  />
+                  <Text style={styles.reviewCardName} numberOfLines={1}>
+                    {card.name}
+                  </Text>
                 </View>
-              )}
+              ))}
+            </View>
+          )}
 
-              <Text style={styles.reviewSection}>Questions & answers</Text>
-              {qaHistory.length === 0 ? (
-                <Text style={styles.reviewEmpty}>No questions asked yet.</Text>
-              ) : (
-                qaHistory.map(({ question, answer }) => (
-                  <View key={question.id} style={styles.reviewQa}>
-                    <Text style={styles.reviewQaMeta}>
-                      {question.author_id === user?.id
-                        ? 'You asked'
-                        : `${nameFor(question.author_slot, 'Opponent')} asked`}
-                    </Text>
-                    <Text style={styles.reviewQuestion}>{question.body}</Text>
-                    <Text style={styles.reviewAnswer}>
-                      {answer ? answer.body : 'Awaiting answer…'}
-                    </Text>
-                  </View>
-                ))
-              )}
-            </ScrollView>
-          </View>
-        </>
-      )}
+          <Text style={styles.reviewSection}>Questions & answers</Text>
+          {qaHistory.length === 0 ? (
+            <Text style={styles.reviewEmpty}>No questions asked yet.</Text>
+          ) : (
+            qaHistory.map(({ question, answer }) => (
+              <View key={question.id} style={styles.reviewQa}>
+                <Text style={styles.reviewQaMeta}>
+                  {question.author_id === user?.id
+                    ? 'You asked'
+                    : `${nameFor(question.author_slot, 'Opponent')} asked`}
+                </Text>
+                <Text style={styles.reviewQuestion}>{question.body}</Text>
+                <Text style={styles.reviewAnswer}>
+                  {answer ? answer.body : 'Awaiting answer…'}
+                </Text>
+              </View>
+            ))
+          )}
+        </ScrollView>
+      </CardModal>
 
-      {selected && (
-        <>
-          <Pressable
-            style={styles.detailBackdrop}
-            onPress={() => setSelected(null)}
-            accessibilityLabel="Close details"
-          />
-          <View style={styles.detailPanel}>
-            <Pressable
-              style={styles.detailClose}
-              hitSlop={16}
-              onPress={() => setSelected(null)}>
-              <Text style={styles.detailCloseText}>✕</Text>
-            </Pressable>
-            <Image source={{ uri: selected.sprite_url }} style={styles.detailSprite} contentFit="contain" />
+      {/* Tile details (long-press). */}
+      <CardModal visible={selected !== null} onClose={() => setSelected(null)}>
+        {selected && (
+          <View style={styles.detailRow}>
+            <Image
+              source={{ uri: selected.sprite_url }}
+              style={styles.detailSprite}
+              contentFit="contain"
+            />
             <View style={styles.detailInfo}>
               <Text style={styles.detailName}>{selected.name}</Text>
               <View style={styles.typeRow}>
-                {selected.types.map((type) => (
+                {selected.types.map((t) => (
                   <View
-                    key={type}
-                    style={[styles.typeChip, { backgroundColor: typeColors[type] ?? colors.textMuted }]}>
-                    <Text style={styles.typeChipText}>{type}</Text>
+                    key={t}
+                    style={[styles.typeChip, { backgroundColor: typeColors[t] ?? colors.inkMuted }]}>
+                    <Text style={styles.typeChipText}>{t}</Text>
                   </View>
                 ))}
               </View>
               <Text style={styles.detailGen}>Generation {selected.generation}</Text>
             </View>
           </View>
-        </>
-      )}
-    </View>
+        )}
+      </CardModal>
+    </Screen>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: colors.background },
-  center: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.background },
-  board: { flex: 1 },
-  grid: {
+  center: { alignItems: 'center', justifyContent: 'center' },
+  error: { color: colors.danger, marginTop: spacing.sm, textAlign: 'center' },
+
+  // Turn strip
+  strip: {
     flexDirection: 'row',
-    flexWrap: 'wrap',
-    justifyContent: 'space-between',
-    padding: 8,
+    alignItems: 'center',
+    gap: spacing.sm,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    backgroundColor: colors.surface,
+    borderBottomWidth: 1.5,
+    borderBottomColor: colors.border,
   },
-  card: {
-    width: '23%',
-    aspectRatio: 0.8,
-    backgroundColor: colors.card,
-    borderRadius: 10,
+  stripBody: { flex: 1 },
+  stripText: { ...type.label, fontSize: 14 },
+  stripHint: { ...type.caption, fontSize: 11 },
+  stripReview: { color: colors.primary, fontWeight: '800', fontSize: 13 },
+  stripResign: { color: colors.danger, fontWeight: '800', fontSize: 13 },
+
+  // Board: fixed rows split the available height — 24 tiles, no scrolling.
+  board: { flex: 1, padding: spacing.sm, gap: spacing.sm },
+  boardRow: { flex: 1, flexDirection: 'row', gap: spacing.sm },
+  boardLoading: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  tile: {
+    flex: 1,
+    backgroundColor: colors.surface,
+    borderRadius: radii.md,
     borderWidth: 1.5,
     borderColor: colors.border,
-    marginVertical: 4,
     alignItems: 'center',
     justifyContent: 'center',
-    padding: 4,
+    padding: spacing.xs,
+    ...shadows.card,
   },
-  cardMine: { borderColor: colors.accent, borderWidth: 2.5 },
-  cardGuessTarget: { borderColor: colors.correct, borderWidth: 3, backgroundColor: colors.correctBg },
-  sprite: { width: '100%', height: '70%' },
-  spriteCrossed: { opacity: 0.2 },
-  name: { fontSize: 10, fontWeight: '600', color: colors.text, textTransform: 'capitalize' },
-  nameCrossed: { color: colors.textMuted, textDecorationLine: 'line-through' },
+  tileMine: { borderColor: colors.accent, borderWidth: 2.5 },
+  tileGuessTarget: {
+    borderColor: colors.success,
+    borderWidth: 3,
+    backgroundColor: colors.successSoft,
+  },
+  tileSprite: { width: '100%', flex: 1 },
+  tileSpriteCrossed: { opacity: 0.2 },
+  tileName: {
+    fontSize: 10,
+    fontWeight: '600',
+    color: colors.ink,
+    textTransform: 'capitalize',
+  },
+  tileNameCrossed: { color: colors.inkFaint, textDecorationLine: 'line-through' },
   crossOverlay: { ...StyleSheet.absoluteFillObject, alignItems: 'center', justifyContent: 'center' },
-  crossMark: { fontSize: 34, fontWeight: '900', color: colors.wrong, opacity: 0.85 },
-  loadingBoard: { color: colors.textMuted, textAlign: 'center', width: '100%', marginTop: 40 },
+  crossMark: { fontSize: 34, fontWeight: '900', color: colors.danger, opacity: 0.85 },
 
-  // Turn banner
-  turnBanner: {
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    backgroundColor: colors.card,
-    borderBottomWidth: 1,
-    borderBottomColor: colors.border,
-    alignItems: 'center',
-  },
-  turnBannerGuess: { backgroundColor: colors.correctBg, borderBottomColor: colors.correct },
-  turnText: { fontSize: 16, fontWeight: '800', color: colors.text },
-  turnHint: { fontSize: 11, color: colors.textMuted, marginTop: 2 },
-  reviewBtn: {
-    position: 'absolute',
-    right: 12,
-    top: 0,
-    bottom: 0,
-    justifyContent: 'center',
-  },
-  reviewBtnText: { color: colors.primary, fontWeight: '800', fontSize: 13 },
-
-  // Resign & inactivity claim
-  resignBtn: {
-    position: 'absolute',
-    left: 12,
-    top: 0,
-    bottom: 0,
-    justifyContent: 'center',
-  },
-  resignText: { color: colors.wrong, fontWeight: '800', fontSize: 13 },
-  drawResign: { marginTop: 10, padding: 4 },
-  claimCountdown: {
-    color: colors.textMuted,
-    fontSize: 12,
-    textAlign: 'center',
-    marginTop: 6,
-  },
-  claimBtn: {
-    marginTop: 10,
-    paddingVertical: 11,
-    paddingHorizontal: 14,
-    borderRadius: 10,
+  // Draw phase
+  tileBack: { backgroundColor: colors.primary, borderColor: colors.primaryPressed },
+  tileMineBack: { backgroundColor: colors.accent, borderColor: colors.accentPressed },
+  tileBackMark: { fontSize: 24, fontWeight: '800', color: colors.onPrimary },
+  secretBanner: {
+    marginHorizontal: spacing.md,
+    marginTop: spacing.sm,
+    padding: spacing.sm,
+    backgroundColor: colors.accentSoft,
+    borderRadius: radii.md,
     borderWidth: 1.5,
-    borderColor: colors.correct,
-    backgroundColor: colors.correctBg,
+    borderColor: colors.accent,
     alignItems: 'center',
   },
-  claimBtnText: { color: colors.correct, fontWeight: '800', fontSize: 14, textAlign: 'center' },
+  secretLabel: { color: colors.accentPressed, fontWeight: '700', fontSize: 12 },
+  secretCardRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
+  secretSprite: { width: 44, height: 44 },
+  secretName: { ...type.heading, textTransform: 'capitalize' },
 
-  // Review panel (slide-up over the board)
-  reviewPanel: {
+  // Chat bubble
+  bubble: {
     position: 'absolute',
-    left: 0,
-    right: 0,
-    bottom: 0,
-    maxHeight: '75%',
-    backgroundColor: colors.card,
-    borderTopLeftRadius: 16,
-    borderTopRightRadius: 16,
-    borderTopWidth: 1,
-    borderTopColor: colors.border,
-    zIndex: 11,
-    elevation: 11,
-  },
-  reviewHeader: {
+    right: spacing.lg,
+    width: 60,
+    height: 60,
+    borderRadius: radii.pill,
+    backgroundColor: colors.primary,
+    borderWidth: 2,
+    borderColor: colors.primaryPressed,
     alignItems: 'center',
-    paddingTop: 14,
-    paddingBottom: 10,
-    borderBottomWidth: 1,
-    borderBottomColor: colors.border,
+    justifyContent: 'center',
+    ...shadows.floating,
   },
-  reviewTitle: { fontSize: 18, fontWeight: '800', color: colors.text },
-  reviewSummary: { fontSize: 12, color: colors.textMuted, marginTop: 2 },
-  reviewContent: { padding: 16, paddingBottom: 28 },
-  reviewSection: {
-    fontSize: 13,
+  bubbleIcon: { fontSize: 26 },
+  bubbleDot: {
+    position: 'absolute',
+    top: 2,
+    right: 2,
+    width: 15,
+    height: 15,
+    borderRadius: radii.pill,
+    backgroundColor: colors.accent,
+    borderWidth: 2,
+    borderColor: colors.surface,
+  },
+
+  // Chat modal
+  thread: { maxHeight: 280, flexGrow: 0 },
+  threadContent: { paddingBottom: spacing.xs },
+  threadEmpty: { ...type.caption, textAlign: 'center', paddingVertical: spacing.md },
+  eventRow: { marginBottom: spacing.sm, alignItems: 'flex-start' },
+  eventRowMine: { alignItems: 'flex-end' },
+  eventMeta: { ...type.caption, fontSize: 11, fontWeight: '600', marginBottom: 2 },
+  eventBubble: {
+    backgroundColor: colors.surfaceSunken,
+    borderRadius: radii.md,
+    paddingHorizontal: spacing.sm + 2,
+    paddingVertical: spacing.xs + 2,
+    maxWidth: '90%',
+  },
+  eventBubbleMine: { backgroundColor: colors.primarySoft },
+  eventBody: { ...type.body },
+  eventAnswer: { fontWeight: '700' },
+  quickRow: { flexDirection: 'row', gap: spacing.sm, marginTop: spacing.sm },
+  quickBtn: { flex: 1 },
+  inputRow: { flexDirection: 'row', gap: spacing.sm, alignItems: 'flex-start', marginTop: spacing.sm },
+  input: { flex: 1 },
+  waitingHint: { ...type.caption, textAlign: 'center', marginTop: spacing.sm, fontStyle: 'italic' },
+  guessStart: { marginTop: spacing.sm },
+
+  // Guessing
+  guessBar: {
+    flexDirection: 'row',
+    gap: spacing.sm,
+    paddingHorizontal: spacing.sm,
+    paddingBottom: spacing.sm,
+  },
+  guessCancel: { flex: 1 },
+  guessConfirm: { flex: 2 },
+  guessFeedback: {
+    backgroundColor: colors.dangerSoft,
+    alignItems: 'center',
+    paddingVertical: spacing.sm,
+    borderRadius: radii.md,
+    marginHorizontal: spacing.sm,
+    marginTop: spacing.sm,
+  },
+  guessFeedbackText: { color: colors.danger, fontWeight: '700', textAlign: 'center' },
+  guessFeedbackLink: {
+    color: colors.danger,
     fontWeight: '800',
-    color: colors.textMuted,
-    textTransform: 'uppercase',
-    marginBottom: 8,
-    marginTop: 12,
+    textDecorationLine: 'underline',
+    marginTop: spacing.xs,
   },
-  reviewEmpty: { color: colors.textMuted, fontStyle: 'italic', marginBottom: 4 },
-  reviewGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+
+  // Claim
+  claimWrap: { paddingHorizontal: spacing.md, paddingTop: spacing.sm },
+  claimCountdown: { ...type.caption, textAlign: 'center', marginTop: spacing.xs + 2 },
+
+  // Review modal
+  reviewSummary: { ...type.caption, marginBottom: spacing.sm },
+  reviewScroll: { maxHeight: 380, flexGrow: 0 },
+  reviewContent: { paddingBottom: spacing.sm },
+  reviewSection: {
+    ...type.caption,
+    fontWeight: '800',
+    textTransform: 'uppercase',
+    marginBottom: spacing.sm,
+    marginTop: spacing.md,
+  },
+  reviewEmpty: { ...type.caption, fontStyle: 'italic', marginBottom: spacing.xs },
+  reviewGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm },
   reviewCard: {
     width: '15%',
     minWidth: 52,
     alignItems: 'center',
-    backgroundColor: colors.background,
-    borderRadius: 8,
+    backgroundColor: colors.surfaceSunken,
+    borderRadius: radii.sm,
     borderWidth: 1,
     borderColor: colors.border,
-    padding: 4,
+    padding: spacing.xs,
     opacity: 0.75,
   },
   reviewSprite: { width: 40, height: 40 },
   reviewCardName: {
     fontSize: 9,
-    color: colors.textMuted,
+    color: colors.inkMuted,
     textTransform: 'capitalize',
     textDecorationLine: 'line-through',
   },
   reviewQa: {
-    backgroundColor: colors.background,
-    borderRadius: 10,
+    backgroundColor: colors.surfaceSunken,
+    borderRadius: radii.md,
     borderWidth: 1,
     borderColor: colors.border,
-    padding: 10,
-    marginBottom: 8,
+    padding: spacing.sm + 2,
+    marginBottom: spacing.sm,
   },
-  reviewQaMeta: { fontSize: 11, color: colors.textMuted, fontWeight: '600' },
-  reviewQuestion: { fontSize: 15, color: colors.text, marginTop: 2 },
-  reviewAnswer: { fontSize: 15, color: colors.text, fontWeight: '700', marginTop: 4 },
+  reviewQaMeta: { ...type.caption, fontSize: 11, fontWeight: '600' },
+  reviewQuestion: { ...type.body, marginTop: 2 },
+  reviewAnswer: { ...type.body, fontWeight: '700', marginTop: spacing.xs },
 
-  // Guessing
-  guessFeedback: {
-    backgroundColor: colors.wrongBg,
-    alignItems: 'center',
-    paddingVertical: 8,
-    borderRadius: 10,
-    marginBottom: 8,
-    overflow: 'hidden',
-  },
-  guessFeedbackText: { color: colors.wrong, fontWeight: '700', textAlign: 'center' },
-  guessFeedbackLink: {
-    color: colors.wrong,
-    fontWeight: '800',
-    textDecorationLine: 'underline',
-    marginTop: 4,
-  },
-  guessStartBtn: {
-    marginTop: 10,
-    paddingVertical: 11,
-    borderRadius: 10,
-    borderWidth: 1.5,
-    borderColor: colors.correct,
-    backgroundColor: colors.correctBg,
-    alignItems: 'center',
-  },
-  guessStartText: { color: colors.correct, fontWeight: '800', fontSize: 15 },
-  guessBar: { flexDirection: 'row', gap: 8, alignItems: 'center', marginTop: 4 },
-  guessCancelBtn: {
-    paddingHorizontal: 18,
-    paddingVertical: 12,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: colors.border,
-  },
-  guessCancelText: { color: colors.text, fontWeight: '700' },
-  guessConfirmBtn: {
-    flex: 1,
-    paddingVertical: 12,
-    borderRadius: 10,
-    backgroundColor: colors.correct,
-    alignItems: 'center',
-  },
-
-  // End screen
-  endPanel: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 24 },
-  endTitle: { fontSize: 32, fontWeight: '900', marginBottom: 8 },
-  endWin: { color: colors.correct },
-  endLose: { color: colors.wrong },
-  endSubtitle: { fontSize: 15, color: colors.textMuted, textAlign: 'center', marginBottom: 28 },
-  revealRow: { flexDirection: 'row', gap: 20 },
-  revealCol: {
-    alignItems: 'center',
-    backgroundColor: colors.card,
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: colors.border,
-    padding: 16,
-    minWidth: 130,
-  },
-  revealLabel: { fontSize: 12, color: colors.textMuted, fontWeight: '700', marginBottom: 8 },
-  revealSprite: { width: 88, height: 88 },
-  revealName: { fontSize: 16, fontWeight: '700', color: colors.text, textTransform: 'capitalize', marginTop: 4 },
-
-  // Q/A thread + input
-  threadPanel: {
-    borderTopWidth: 1,
-    borderTopColor: colors.border,
-    backgroundColor: colors.card,
-    paddingHorizontal: 12,
-    paddingTop: 8,
-    paddingBottom: 12,
-  },
-  thread: { maxHeight: 150 },
-  threadContent: { paddingBottom: 4 },
-  threadEmpty: { color: colors.textMuted, textAlign: 'center', paddingVertical: 12 },
-  eventRow: { marginBottom: 8, alignItems: 'flex-start' },
-  eventRowMine: { alignItems: 'flex-end' },
-  eventMeta: { fontSize: 11, color: colors.textMuted, fontWeight: '600' },
-  eventBody: { fontSize: 15, color: colors.text, marginTop: 1 },
-  eventAnswer: { fontWeight: '700' },
-  quickRow: { flexDirection: 'row', gap: 10, marginTop: 4, marginBottom: 8 },
-  quickBtn: {
-    flex: 1,
-    paddingVertical: 10,
-    borderRadius: 10,
-    backgroundColor: colors.selectedBg,
-    borderWidth: 1,
-    borderColor: colors.selected,
-    alignItems: 'center',
-  },
-  quickText: { fontWeight: '800', color: colors.text, fontSize: 15 },
-  inputRow: { flexDirection: 'row', gap: 8, alignItems: 'center', marginTop: 4 },
-  input: {
-    flex: 1,
-    backgroundColor: colors.background,
-    borderWidth: 1,
-    borderColor: colors.border,
-    borderRadius: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    color: colors.text,
-    fontSize: 15,
-  },
-  sendBtn: {
-    paddingHorizontal: 18,
-    paddingVertical: 11,
-    borderRadius: 10,
-    backgroundColor: colors.primary,
-  },
-  sendBtnDisabled: { opacity: 0.5 },
-  sendText: { color: colors.onPrimary, fontWeight: '800' },
-  waitingHint: { color: colors.textMuted, textAlign: 'center', marginTop: 6, fontStyle: 'italic' },
-
-  // Draw phase
-  drawHeader: { padding: 16, alignItems: 'center' },
-  drawTitle: { fontSize: 22, fontWeight: '800', color: colors.text },
-  drawBanner: { color: colors.textMuted, marginTop: 4, textAlign: 'center' },
-  cardBack: { backgroundColor: colors.primary, borderColor: colors.primaryDark },
-  cardMineBack: { backgroundColor: colors.accent, borderColor: colors.accentDark },
-  cardBackMark: { fontSize: 24, fontWeight: '800', color: colors.onPrimary },
-  secretBanner: {
-    marginHorizontal: 16,
-    marginBottom: 8,
-    padding: 12,
-    backgroundColor: colors.accentBg,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: colors.accent,
-    alignItems: 'center',
-  },
-  secretLabel: { color: colors.accentDark, fontWeight: '700', marginBottom: 4 },
-  secretCardRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  secretSprite: { width: 56, height: 56 },
-  secretName: { fontSize: 18, fontWeight: '700', color: colors.text, textTransform: 'capitalize' },
-
-  detailBackdrop: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(0,0,0,0.35)',
-    zIndex: 10,
-  },
-  detailPanel: {
-    position: 'absolute',
-    left: 0,
-    right: 0,
-    bottom: 0,
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: colors.card,
-    borderTopWidth: 1,
-    borderTopColor: colors.border,
-    padding: 16,
-    paddingTop: 28,
-    gap: 16,
-    zIndex: 11,
-    elevation: 11,
-  },
-  detailClose: { position: 'absolute', top: 8, right: 12, padding: 6, zIndex: 12 },
-  detailCloseText: { color: colors.textMuted, fontSize: 16, fontWeight: '700' },
+  // Tile details
+  detailRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.lg },
   detailSprite: { width: 72, height: 72 },
   detailInfo: { flex: 1 },
-  detailName: { fontSize: 20, fontWeight: '700', color: colors.text, textTransform: 'capitalize' },
-  typeRow: { flexDirection: 'row', gap: 6, marginTop: 6 },
-  typeChip: { borderRadius: 12, paddingVertical: 3, paddingHorizontal: 10 },
+  detailName: { ...type.title, textTransform: 'capitalize' },
+  typeRow: { flexDirection: 'row', gap: spacing.xs + 2, marginTop: spacing.xs + 2 },
+  typeChip: { borderRadius: radii.pill, paddingVertical: 3, paddingHorizontal: spacing.sm + 2 },
   typeChipText: { color: colors.onPrimary, fontWeight: '700', fontSize: 12, textTransform: 'capitalize' },
-  detailGen: { color: colors.textMuted, marginTop: 6, fontWeight: '600' },
-  error: { color: colors.wrong, marginTop: 8, textAlign: 'center' },
+  detailGen: { ...type.caption, marginTop: spacing.xs + 2, fontWeight: '600' },
+
+  // End screen
+  endPanel: { alignItems: 'center', justifyContent: 'center' },
+  endTitle: { fontSize: 32, fontWeight: '900', marginBottom: spacing.sm },
+  endWin: { color: colors.success },
+  endLose: { color: colors.danger },
+  endSubtitle: { ...type.body, color: colors.inkMuted, textAlign: 'center', marginBottom: spacing.xl },
+  revealRow: { flexDirection: 'row', gap: spacing.lg },
+  revealCol: {
+    alignItems: 'center',
+    backgroundColor: colors.surface,
+    borderRadius: radii.lg,
+    borderWidth: 1.5,
+    borderColor: colors.border,
+    padding: spacing.lg,
+    minWidth: 130,
+    ...shadows.card,
+  },
+  revealLabel: { ...type.caption, fontWeight: '700', marginBottom: spacing.sm },
+  revealSprite: { width: 88, height: 88 },
+  revealName: { ...type.heading, textTransform: 'capitalize', marginTop: spacing.xs },
 });

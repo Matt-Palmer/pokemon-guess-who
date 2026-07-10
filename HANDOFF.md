@@ -1,4 +1,4 @@
-# Pokémon Guess Who — Handoff (Issue 12 complete: UI/UX redesign underway — issues 13–16 remain)
+# Pokémon Guess Who — Handoff (Issue 13 complete: UI/UX redesign underway — issues 14–16 remain)
 
 **Project:** `/Users/Matt/Dev/pokemon-guess-who` — Expo/expo-router + Clerk auth + Supabase (Postgres + Realtime).
 Supabase project ref `azaemyxdzapolhqmcwpq`. Issues live in `issues/`, spec in `PRD.md`.
@@ -209,14 +209,41 @@ Supabase project ref `azaemyxdzapolhqmcwpq`. Issues live in `issues/`, spec in `
   - ⚠️ react-native-web logs a `"shadow*" style props are deprecated. Use "boxShadow"` warning — cosmetic,
     web-only; native is the design target (iPhone portrait first, per the grilling decisions).
 
+- **Issue 13** (match screen restructure — board owns the viewport): presentation-only rewrite of
+  `src/app/match/[id].tsx` onto `@/ui`; no reducer/RPC/DB changes. Verified in the web preview at iPhone SE
+  size (375×667) signed in as `rlstest1`, against live test matches.
+  - **Board never scrolls**: 6 flex rows × 4 tiles split the available height (`BoardGrid`) — fit is by
+    construction, measured zero scrollable containers at SE size, with and without the guess bar. The draw
+    phase reuses the same grid (face-down tiles).
+  - **Turn strip** (slim, always visible) replaces the old turn banner: phase Badge (accent when it's your
+    move) + short whose-move copy + Review + Resign. First-match hint copy shows until the thread has events;
+    guess mode gets its own strip state. Copy is deliberately terse — long strings truncate at SE width.
+  - **Thread → chat bubble + chat modal** (ADR 0001, `docs/adr/0001-board-owns-the-viewport.md`): no docked
+    panel; a floating bubble (pulses when you owe an answer / it's your move to ask, dot for unread opponent
+    events, quiet otherwise) opens a `CardModal` with the thread, ask input, Yes/No quick answers + answer
+    input. **Auto-opens only on the false→true edge of "I owe an answer"** (`wasAnswering` ref) — entering the
+    screen or live arrival; ask never auto-opens. The draft (`input`) lives in screen state, so dismissing and
+    reopening preserves it (verified). Unread baseline: the first loaded batch is history, not news.
+  - Review panel and card-detail panel moved onto the shared `CardModal`; guessing stays on the board
+    (tap tile → Cancel / "Guess {name}" confirm bar, Buttons from `@/ui`).
+  - **`CardModal` fixes (in `src/ui/`)**: `animationType="none"` — RN-web's animated modal wrapper can wedge
+    at `pointer-events:none` if its CSS animationend never fires, killing all clicks inside the modal (hit in
+    the preview; the card's own ZoomIn covers the entrance) — and the card wrap Pressable now calls
+    `stopPropagation` so card taps can't bubble to the backdrop's dismiss on web.
+  - 92/92 unit tests, `tsc` clean, lint clean, no console errors. Live flows exercised in the preview:
+    auto-open on an answer-owed match (real question from `rlstest2`), draft survival across dismiss/reopen,
+    guess mode enter/target/cancel, cross-off toggle (on and back off), review modal. Not smoke-tested on a
+    real device. Not exercised from the preview: sending an ask/answer/guess (would mutate the live test
+    matches) — those RPCs are unchanged and integration-tested.
+
 ## Next steps
 
-Issues 1–12 are complete. **Redesign issues remain: 13 (match screen restructure — board on one screen, chat
-bubble/modal, turn strip + ADR 0001), 14 (motion), 15 (home + new-game flow), 16 (auth + player card)** — specs
-in `issues/`. Other known gaps, in rough priority order:
+Issues 1–13 are complete. **Redesign issues remain: 14 (motion — draw ceremony, guess reveal), 15 (home +
+new-game flow), 16 (auth + player card)** — specs in `issues/`. Other known gaps, in rough priority order:
 
-- **Device smoke tests**: Issues 7, 8, 10 and 11 have never been exercised on a real device (need two players
-  mid-match). The full flows are integration-tested against the live DB.
+- **Device smoke tests**: Issues 7, 8, 10, 11 and the redesign (12–13) have never been exercised on a real
+  device (need two players mid-match). The full flows are integration-tested against the live DB, and 12–13
+  were exercised in the web preview.
 - **Real push delivery**: needs `eas init` (EAS projectId) + a development build — see the gotcha below. The
   entire server pipeline is already live and verified on the wire.
 - Possible polish: matchmaking currently allows being paired with someone you already have an active game
