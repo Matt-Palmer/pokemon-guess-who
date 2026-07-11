@@ -1,4 +1,4 @@
-# Pokémon Guess Who — Handoff (Issue 13 complete: UI/UX redesign underway — issues 14–16 remain)
+# Pokémon Guess Who — Handoff (Issue 14 complete: UI/UX redesign underway — issues 15–16 remain)
 
 **Project:** `/Users/Matt/Dev/pokemon-guess-who` — Expo/expo-router + Clerk auth + Supabase (Postgres + Realtime).
 Supabase project ref `azaemyxdzapolhqmcwpq`. Issues live in `issues/`, spec in `PRD.md`.
@@ -236,13 +236,47 @@ Supabase project ref `azaemyxdzapolhqmcwpq`. Issues live in `issues/`, spec in `
     real device. Not exercised from the preview: sending an ask/answer/guess (would mutate the live test
     matches) — those RPCs are unchanged and integration-tested.
 
+- **Issue 14** (motion): presentation-only, all on Reanimated (no new deps); no reducer/RPC/DB changes.
+  Verified live in the web preview at iPhone SE size against staged matches (see below).
+  - **Pure gating** `src/lib/game/reveal.ts` (+11 unit tests): `shouldPlayGuessReveal(prevStatus, match)` — the
+    reveal plays only on the *observed* `active → completed` edge with `ended_reason='guess'` (fresh mounts of
+    finished matches, resigns, and claims get no theatrics) — and `guessedSecretId` (the card that turns over is
+    the **loser's** secret, for both viewers).
+  - **Design system (`src/ui/`)**: `FlipCard` (generic 3D rotateY two-face card; the `flipped` prop is the state,
+    so interruptions just retarget; instant under reduced motion), `CardBack` (poké-ball card back from plain
+    Views — the shared "face-down" look), `Confetti` (one-shot burst, one shared progress value drives all
+    pieces, renders nothing under reduced motion), `motion.ts` (shared timings + `dealDelay`).
+  - **Match components (`src/components/match/`)**: `Tile` (flip tile: deal-in stagger via `ZoomIn.delay`,
+    press squish, wrong-guess shake via `shakeNonce`; **cross-off = flip face-down onto the card back — the ✕
+    overlay is gone**; the flip rides the optimistic `useBoardMarks` state), `GuessReveal` (dim → pause → the
+    secret turns over → confetti bounce or sympathy shake → end screen; tap anywhere skips; reduced motion hands
+    over immediately; the flip waits on both the pause timer AND the `match_result` fetch), `DrawCeremony`
+    (card slides from the deck face-down, beat, flips to your secret, explicit "Got it" dismiss — drawer-only
+    by construction).
+  - **`match/[id].tsx` wiring**: draw board now deals in as face-down card backs (★ overlays your drawn tile);
+    ceremony fires after `drawSecret`+`refetchSecret` and **renders in both the draw and active branches** (a
+    second drawer's ceremony rides the draw→active switch); the guesser's win reveal starts from the RPC result
+    (`card: guessTarget`, no network wait) + `refetch()`, the opponent's from the Realtime status edge; while
+    revealing, the completed branch renders the reveal *instead of* the end panel; wrong guess = shake + the
+    server's auto-cross arrives via `board_marks` and flips the tile; turn-strip copy/badge changes animate via
+    keyed remounts (`FadeIn`/`FadeInDown`); chat bubble got an entrance and its pulse respects reduced motion;
+    end screen title/subtitle/reveal cards get entering animations.
+  - **103/103 unit tests** (43 reducer + 9 stats + 9 review + 9 summary + 7 claim + 15 derive + 11 reveal),
+    `tsc` clean, lint clean. Integration suites untouched (presentation-only).
+  - **Verified live** (web preview, 375×667, rlstest1 vs script-driven rlstest2): deal-in wave, cross-off
+    flip + un-cross, draw ceremony (twice, incl. riding the draw→active switch), wrong-guess feedback +
+    Realtime auto-cross flip, win reveal (MutationObserver timeline: caption 347ms → verdict 3225ms → end
+    screen 6240ms — sequence, then end state), loss reveal via Realtime while the loser's screen was open,
+    win/loss end screens with correct secrets. Not smoke-tested on a real device (60fps/worklet behavior is
+    native-only — worth a look when device testing happens).
+
 ## Next steps
 
-Issues 1–13 are complete. **Redesign issues remain: 14 (motion — draw ceremony, guess reveal), 15 (home +
-new-game flow), 16 (auth + player card)** — specs in `issues/`. Other known gaps, in rough priority order:
+Issues 1–14 are complete. **Redesign issues remain: 15 (home + new-game flow), 16 (auth + player card)** —
+specs in `issues/`. Other known gaps, in rough priority order:
 
-- **Device smoke tests**: Issues 7, 8, 10, 11 and the redesign (12–13) have never been exercised on a real
-  device (need two players mid-match). The full flows are integration-tested against the live DB, and 12–13
+- **Device smoke tests**: Issues 7, 8, 10, 11 and the redesign (12–14) have never been exercised on a real
+  device (need two players mid-match). The full flows are integration-tested against the live DB, and 12–14
   were exercised in the web preview.
 - **Real push delivery**: needs `eas init` (EAS projectId) + a development build — see the gotcha below. The
   entire server pipeline is already live and verified on the wire.
@@ -251,6 +285,23 @@ new-game flow), 16 (auth + player card)** — specs in `issues/`. Other known ga
   but nothing sets it (resign/claim cover the real cases).
 
 ## Gotchas for the new session
+
+- **Motion is presentation only** (issue 14 house rule): animations follow already-written state (`FlipCard`'s
+  `flipped` prop, the status edge) and must never gate or reorder game writes. Known cosmetic artifact: the
+  *guesser's* `GuessReveal` remounts when the row flips to `completed` (the phase branches return different
+  trees), restarting its pause — reads as ~1s extra anticipation; state stays correct. The watcher mounts it
+  once. New animated things should check `useReducedMotion` (custom sequences) — Reanimated skips
+  entering/exiting animations by itself.
+- **Staging live two-player states for preview verification**: mint Clerk session tokens for the two test users
+  exactly like the integration suite (`POST /v1/sessions` + `/tokens` with `CLERK_SECRET_KEY` from `.env.local`)
+  and drive RPCs as rlstest2 while the preview is signed in as rlstest1 — e.g. create/join/start a party,
+  draw as player1, deliberately wrong-guess to pass the move, or guess rlstest1's `my_secret` correctly to
+  trigger the loss reveal over Realtime. Leaves the usual integration-test footprint (matches + stat bumps).
+- **The web preview cold-loads race Clerk**: a full page load straight to `/match/[id]` briefly shows
+  "permission denied for table matches" (the fetch fires before the token). Pre-existing; navigate in-app when
+  verifying. Also, to observe multi-second animation sequences through the preview tools, install a
+  MutationObserver logging phase timestamps to a `window` array, then read it after — tool roundtrips are
+  slower than the animations.
 
 - **`expo-notifications` has no web implementation** — its functions throw on `expo start --web`. All entry
   points are guarded: the module-scope `setNotificationHandler` and `getPushTokenOrNull` bail on

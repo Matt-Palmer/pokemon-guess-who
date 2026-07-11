@@ -4,16 +4,24 @@ import { useLocalSearchParams } from 'expo-router';
 import { ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import Animated, {
+  FadeIn,
+  FadeInDown,
   useAnimatedStyle,
+  useReducedMotion,
   useSharedValue,
   withRepeat,
   withSequence,
   withTiming,
+  ZoomIn,
 } from 'react-native-reanimated';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { DrawCeremony } from '@/components/match/DrawCeremony';
+import { GuessReveal } from '@/components/match/GuessReveal';
+import { Tile } from '@/components/match/Tile';
 import { typeColors } from '@/constants/colors';
 import { claimState, formatRemaining } from '@/lib/game/claim';
+import { guessedSecretId, shouldPlayGuessReveal } from '@/lib/game/reveal';
 import { pairThread, splitByMarks } from '@/lib/game/review';
 import { summarizeTurn } from '@/lib/game/summary';
 import {
@@ -22,6 +30,7 @@ import {
   claimInactiveWin,
   drawSecret,
   guess,
+  MatchStatus,
   PokemonCard,
   resign,
   useBoardMarks,
@@ -58,16 +67,19 @@ function ChatBubble({
   bottom: number;
   onPress: () => void;
 }) {
+  const reduced = useReducedMotion();
   const t = useSharedValue(0);
   useEffect(() => {
-    t.value = pulse
-      ? withRepeat(withSequence(withTiming(1, { duration: 500 }), withTiming(0, { duration: 500 })), -1)
-      : withTiming(0, { duration: 200 });
-  }, [pulse, t]);
+    t.value =
+      pulse && !reduced
+        ? withRepeat(withSequence(withTiming(1, { duration: 500 }), withTiming(0, { duration: 500 })), -1)
+        : withTiming(0, { duration: 200 });
+  }, [pulse, reduced, t]);
   const pulseStyle = useAnimatedStyle(() => ({ transform: [{ scale: 1 + t.value * 0.1 }] }));
 
   return (
     <AnimatedPressable
+      entering={ZoomIn.springify().damping(16).delay(400)}
       style={[styles.bubble, { bottom }, pulseStyle]}
       onPress={onPress}
       accessibilityLabel="Open the question thread">
@@ -97,8 +109,12 @@ function TurnStrip({
 }) {
   return (
     <View style={styles.strip}>
-      <Badge label={phaseLabel} variant={myMove ? 'accent' : 'neutral'} />
-      <View style={styles.stripBody}>
+      {/* Keying on the label/copy remounts these on every phase or move
+          change, so each strip state slides in — the turn-strip transition. */}
+      <Animated.View key={`${phaseLabel}:${myMove}`} entering={FadeIn.duration(250)}>
+        <Badge label={phaseLabel} variant={myMove ? 'accent' : 'neutral'} />
+      </Animated.View>
+      <Animated.View key={text} entering={FadeInDown.duration(250)} style={styles.stripBody}>
         <Text style={styles.stripText} numberOfLines={1}>
           {text}
         </Text>
@@ -107,7 +123,7 @@ function TurnStrip({
             {hint}
           </Text>
         ) : null}
-      </View>
+      </Animated.View>
       {onReview && (
         <Pressable hitSlop={8} onPress={onReview}>
           <Text style={styles.stripReview}>Review</Text>
@@ -128,7 +144,8 @@ function BoardGrid({
   renderTile,
 }: {
   cards: PokemonCard[];
-  renderTile: (card: PokemonCard) => ReactNode;
+  /** `index` is the board position — it times the deal-in wave. */
+  renderTile: (card: PokemonCard, index: number) => ReactNode;
 }) {
   const rows = useMemo(() => {
     const out: PokemonCard[][] = [];
@@ -148,7 +165,7 @@ function BoardGrid({
     <View style={styles.board}>
       {rows.map((row, i) => (
         <View key={i} style={styles.boardRow}>
-          {row.map(renderTile)}
+          {row.map((card, j) => renderTile(card, i * BOARD_COLUMNS + j))}
         </View>
       ))}
     </View>
@@ -181,6 +198,25 @@ export default function MatchScreen() {
   const [chatOpen, setChatOpen] = useState(false);
   const [ending, setEnding] = useState(false);
   const threadRef = useRef<ScrollView>(null);
+  // Motion state (issue 14) — presentation over already-written game state.
+  const [reveal, setReveal] = useState<{ outcome: 'win' | 'loss'; card: PokemonCard | null } | null>(null);
+  const [ceremony, setCeremony] = useState(false);
+  const [shake, setShake] = useState<{ cardId: number; nonce: number } | null>(null);
+
+  // The guess reveal plays on the observed edge into a guess-completed match —
+  // that's how the opponent (watching via Realtime) gets the same turn-over
+  // moment as the guesser. The guesser's own path sets `reveal` directly on a
+  // correct guess (they shouldn't wait on the round-trip), so the edge keeps
+  // whatever is already playing.
+  const prevStatusRef = useRef<MatchStatus | undefined>(undefined);
+  useEffect(() => {
+    const prev = prevStatusRef.current;
+    prevStatusRef.current = match?.status;
+    if (user && match && shouldPlayGuessReveal(prev, match)) {
+      const outcome = match.winner_id === user.id ? 'win' : 'loss';
+      setReveal((current) => current ?? { outcome, card: null });
+    }
+  }, [match, user]);
 
   // Coarse clock for the claim countdown: the window is 7 days, so a slow tick
   // keeps the "claim in Xd Yh" copy honest without re-rendering every second.
@@ -262,6 +298,7 @@ export default function MatchScreen() {
     try {
       await drawSecret(supabase, id, card.id);
       await refetchSecret();
+      setCeremony(true);
     } catch (err: any) {
       setDrawError(err?.message ?? 'Could not draw that card.');
     } finally {
@@ -336,11 +373,18 @@ export default function MatchScreen() {
     setGuessing(true);
     try {
       const res = await guess(supabase, id, guessTarget.id);
-      // On a correct guess the match flips to `completed` via Realtime and the
-      // end screen takes over. On a wrong guess the server auto-crosses the
-      // missed card (arriving via the board_marks stream) and passes the turn.
-      if (!res.correct) {
+      // On a correct guess the reveal sequence starts right away — the guesser
+      // knows the card they named, so the theater never waits on the network —
+      // and the refetch flips the row to `completed` without relying on the
+      // Realtime round-trip. On a wrong guess the missed tile gets a sympathy
+      // shake; the server's auto-cross arrives via the board_marks stream and
+      // flips it face-down.
+      if (res.correct) {
+        setReveal({ outcome: 'win', card: guessTarget });
+        await refetch();
+      } else {
         setGuessFeedback(`Not ${displayName(guessTarget.name)}. Your turn is over.`);
+        setShake((prev) => ({ cardId: guessTarget.id, nonce: (prev?.nonce ?? 0) + 1 }));
       }
       setGuessTarget(null);
       setGuessMode(false);
@@ -417,6 +461,27 @@ export default function MatchScreen() {
       </Text>
     ) : null;
 
+  // Motion overlays shared across the phase branches: a second drawer's
+  // ceremony outlives the draw → active switch, and the guesser's reveal
+  // starts while the row is still `active` (before refetch/Realtime lands).
+  // The card the reveal turns over is the guesser's own pick when we have it;
+  // the watching player resolves it from the end-of-game result.
+  const revealShownCard = reveal
+    ? (reveal.card ?? cards.find((c) => c.id === guessedSecretId(match, result)) ?? null)
+    : null;
+  const revealUi = reveal ? (
+    <GuessReveal
+      outcome={reveal.outcome}
+      card={revealShownCard}
+      oppName={oppName}
+      onDone={() => setReveal(null)}
+    />
+  ) : null;
+  const ceremonyUi =
+    ceremony && mySecretCard ? (
+      <DrawCeremony card={mySecretCard} onDone={() => setCeremony(false)} />
+    ) : null;
+
   // ── Blind-draw phase: tiles face-down until both players have drawn. ──
   if (!bothDrawn) {
     const stripText =
@@ -460,25 +525,32 @@ export default function MatchScreen() {
 
         <BoardGrid
           cards={cards}
-          renderTile={(card) => {
-            const isMine = card.id === mySecretId;
-            return (
-              <Pressable
-                key={card.id}
-                style={[styles.tile, styles.tileBack, isMine && styles.tileMineBack]}
-                disabled={turn.kind !== 'your_draw' || drawing}
-                onPress={() => onDraw(card)}>
-                <Text style={styles.tileBackMark}>{isMine ? '★' : '?'}</Text>
-              </Pressable>
-            );
-          }}
+          renderTile={(card, index) => (
+            <Tile
+              key={card.id}
+              card={card}
+              faceDown
+              dealIndex={index}
+              backMark={card.id === mySecretId ? '★' : undefined}
+              disabled={turn.kind !== 'your_draw' || drawing}
+              onPress={() => onDraw(card)}
+            />
+          )}
         />
+
+        {ceremonyUi}
       </Screen>
     );
   }
 
   // ── Game over: reveal both secrets to winner and loser alike. ──
   if (match.status === 'completed') {
+    // The turn-over sequence plays before the verdict shows (PRD 44); a tap —
+    // or reduced motion — skips straight to the end screen.
+    if (reveal) {
+      return <Screen padded={false}>{revealUi}</Screen>;
+    }
+
     const didIWin = match.winner_id === user?.id;
     const oppSecretId = oppSlot === 'player1' ? result?.player1Secret : result?.player2Secret;
     const mySecretReveal = mySlot === 'player1' ? result?.player1Secret : result?.player2Secret;
@@ -518,14 +590,18 @@ export default function MatchScreen() {
 
     return (
       <Screen style={styles.endPanel}>
-        <Text style={[styles.endTitle, didIWin ? styles.endWin : styles.endLose]}>
+        <Animated.Text
+          entering={ZoomIn.springify().damping(14)}
+          style={[styles.endTitle, didIWin ? styles.endWin : styles.endLose]}>
           {didIWin ? 'You won! 🎉' : 'You lost'}
-        </Text>
-        <Text style={styles.endSubtitle}>{endSubtitle}</Text>
-        <View style={styles.revealRow}>
+        </Animated.Text>
+        <Animated.Text entering={FadeIn.delay(200).duration(300)} style={styles.endSubtitle}>
+          {endSubtitle}
+        </Animated.Text>
+        <Animated.View entering={FadeInDown.delay(350).duration(300)} style={styles.revealRow}>
           <RevealCard label={`${oppName}'s secret`} card={oppSecretCard} />
           <RevealCard label="Your secret" card={mySecretRevealCard} />
-        </View>
+        </Animated.View>
       </Screen>
     );
   }
@@ -578,35 +654,21 @@ export default function MatchScreen() {
 
       <BoardGrid
         cards={cards}
-        renderTile={(card) => {
-          const crossed = marks.has(card.id);
-          const isGuessTarget = guessTarget?.id === card.id;
-          return (
-            <Pressable
-              key={card.id}
-              style={[
-                styles.tile,
-                card.id === mySecretId && styles.tileMine,
-                isGuessTarget && styles.tileGuessTarget,
-              ]}
-              onPress={() => onCardPress(card)}
-              onLongPress={() => setSelected(card)}>
-              <Image
-                source={{ uri: card.sprite_url }}
-                style={[styles.tileSprite, crossed && styles.tileSpriteCrossed]}
-                contentFit="contain"
-              />
-              <Text style={[styles.tileName, crossed && styles.tileNameCrossed]} numberOfLines={1}>
-                {card.name}
-              </Text>
-              {crossed && (
-                <View style={styles.crossOverlay}>
-                  <Text style={styles.crossMark}>✕</Text>
-                </View>
-              )}
-            </Pressable>
-          );
-        }}
+        renderTile={(card, index) => (
+          // Crossing off physically flips the tile face-down (issue 14); the
+          // flip is presentation over the optimistic `useBoardMarks` state.
+          <Tile
+            key={card.id}
+            card={card}
+            faceDown={marks.has(card.id)}
+            dealIndex={index}
+            mine={card.id === mySecretId}
+            targeted={guessTarget?.id === card.id}
+            shakeNonce={shake?.cardId === card.id ? shake.nonce : 0}
+            onPress={() => onCardPress(card)}
+            onLongPress={() => setSelected(card)}
+          />
+        )}
       />
 
       {guessMode && (
@@ -798,6 +860,11 @@ export default function MatchScreen() {
           </View>
         )}
       </CardModal>
+
+      {/* A second drawer's ceremony rides the draw → active switch; the
+          guesser's reveal starts here, before the completed row lands. */}
+      {ceremonyUi}
+      {revealUi}
     </Screen>
   );
 }
@@ -824,42 +891,12 @@ const styles = StyleSheet.create({
   stripResign: { color: colors.danger, fontWeight: '800', fontSize: 13 },
 
   // Board: fixed rows split the available height — 24 tiles, no scrolling.
+  // (Tile faces, card backs, and the flip live in @/components/match/Tile.)
   board: { flex: 1, padding: spacing.sm, gap: spacing.sm },
   boardRow: { flex: 1, flexDirection: 'row', gap: spacing.sm },
   boardLoading: { flex: 1, alignItems: 'center', justifyContent: 'center' },
-  tile: {
-    flex: 1,
-    backgroundColor: colors.surface,
-    borderRadius: radii.md,
-    borderWidth: 1.5,
-    borderColor: colors.border,
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: spacing.xs,
-    ...shadows.card,
-  },
-  tileMine: { borderColor: colors.accent, borderWidth: 2.5 },
-  tileGuessTarget: {
-    borderColor: colors.success,
-    borderWidth: 3,
-    backgroundColor: colors.successSoft,
-  },
-  tileSprite: { width: '100%', flex: 1 },
-  tileSpriteCrossed: { opacity: 0.2 },
-  tileName: {
-    fontSize: 10,
-    fontWeight: '600',
-    color: colors.ink,
-    textTransform: 'capitalize',
-  },
-  tileNameCrossed: { color: colors.inkFaint, textDecorationLine: 'line-through' },
-  crossOverlay: { ...StyleSheet.absoluteFillObject, alignItems: 'center', justifyContent: 'center' },
-  crossMark: { fontSize: 34, fontWeight: '900', color: colors.danger, opacity: 0.85 },
 
   // Draw phase
-  tileBack: { backgroundColor: colors.primary, borderColor: colors.primaryPressed },
-  tileMineBack: { backgroundColor: colors.accent, borderColor: colors.accentPressed },
-  tileBackMark: { fontSize: 24, fontWeight: '800', color: colors.onPrimary },
   secretBanner: {
     marginHorizontal: spacing.md,
     marginTop: spacing.sm,
