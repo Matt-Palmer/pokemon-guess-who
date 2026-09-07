@@ -2,11 +2,11 @@ import { useUser } from '@clerk/clerk-expo';
 import * as Clipboard from 'expo-clipboard';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useEffect, useState } from 'react';
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
 
-import { colors } from '@/constants/colors';
 import { startMatch, useMatch, useMatchPlayers } from '@/lib/matches';
 import { useSupabase } from '@/lib/supabase';
+import { Button, Card, Screen, colors, radii, spacing, type } from '@/ui';
 
 export default function LobbyScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
@@ -52,33 +52,41 @@ export default function LobbyScreen() {
 
   if (loading) {
     return (
-      <View style={styles.center}>
+      <Screen style={styles.center}>
         <ActivityIndicator color={colors.primary} />
-      </View>
+      </Screen>
     );
   }
 
   if (error || !match) {
     return (
-      <View style={styles.center}>
+      <Screen style={styles.center}>
         <Text style={styles.error}>{error ?? 'Party not found.'}</Text>
-      </View>
+      </Screen>
     );
   }
 
   return (
-    <View style={styles.container}>
-      <View style={styles.codeCard}>
+    <Screen>
+      <Card style={styles.codeCard}>
         <Text style={styles.codeLabel}>Party code</Text>
         <Text style={styles.code}>{match.party_code}</Text>
-        <Pressable style={styles.copyButton} onPress={onCopy}>
-          <Text style={styles.copyButtonText}>{copied ? 'Copied!' : 'Copy code'}</Text>
-        </Pressable>
-      </View>
+        <Button
+          title={copied ? 'Copied!' : 'Copy code'}
+          variant="secondary"
+          onPress={onCopy}
+          style={styles.copyButton}
+        />
+      </Card>
 
       <View style={styles.statusCard}>
         {match.player2_id ? (
           <>
+            <View style={styles.avatar}>
+              <Text style={styles.avatarText}>
+                {opponent?.avatar || opponent?.username?.charAt(0).toUpperCase() || '?'}
+              </Text>
+            </View>
             <Text style={styles.joinedLabel}>Opponent joined</Text>
             <Text style={styles.joinedName}>{opponent?.username ?? '…'}</Text>
           </>
@@ -90,61 +98,49 @@ export default function LobbyScreen() {
         )}
       </View>
 
+      <View style={styles.spacer} />
+
       {isHost ? (
         <>
-          <Pressable
-            style={[styles.startButton, (!match.player2_id || starting) && styles.buttonDisabled]}
+          <Button
+            title="Start"
             onPress={onStart}
-            disabled={!match.player2_id || starting}>
-            {starting ? (
-              <ActivityIndicator color={colors.onPrimary} />
-            ) : (
-              <Text style={styles.startButtonText}>Start</Text>
-            )}
-          </Pressable>
+            busy={starting}
+            disabled={!match.player2_id || starting}
+          />
           {startError && <Text style={styles.error}>{startError}</Text>}
         </>
       ) : (
         <Text style={styles.waitingHost}>Waiting for the host to start…</Text>
       )}
-    </View>
+    </Screen>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, padding: 24, backgroundColor: colors.background },
-  center: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.background },
-  codeCard: {
-    backgroundColor: colors.card,
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: colors.border,
-    padding: 24,
+  center: { alignItems: 'center', justifyContent: 'center' },
+  codeCard: { alignItems: 'center', gap: spacing.sm },
+  codeLabel: { ...type.label, color: colors.inkMuted },
+  code: { fontSize: 40, fontWeight: '900', letterSpacing: 8, color: colors.ink },
+  copyButton: { alignSelf: 'center', paddingHorizontal: spacing.xl },
+  statusCard: { alignItems: 'center', gap: spacing.sm, marginTop: spacing.xxl },
+  avatar: {
+    width: 64,
+    height: 64,
+    borderRadius: radii.pill,
+    backgroundColor: colors.accentSoft,
+    borderWidth: 1.5,
+    borderColor: colors.accent,
     alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: spacing.xs,
   },
-  codeLabel: { color: colors.textMuted, fontWeight: '600' },
-  code: { fontSize: 40, fontWeight: '800', letterSpacing: 8, color: colors.text, marginVertical: 12 },
-  copyButton: {
-    backgroundColor: colors.primaryBg,
-    borderRadius: 10,
-    paddingVertical: 8,
-    paddingHorizontal: 20,
-  },
-  copyButtonText: { color: colors.primaryDark, fontWeight: '700' },
-  statusCard: { alignItems: 'center', marginTop: 32 },
-  waitingRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  waiting: { color: colors.textMuted, fontSize: 16 },
-  joinedLabel: { color: colors.textMuted, fontWeight: '600' },
-  joinedName: { fontSize: 22, fontWeight: '700', color: colors.text, marginTop: 4 },
-  startButton: {
-    backgroundColor: colors.primary,
-    borderRadius: 12,
-    padding: 16,
-    alignItems: 'center',
-    marginTop: 'auto',
-  },
-  startButtonText: { color: colors.onPrimary, fontWeight: '700', fontSize: 16 },
-  buttonDisabled: { opacity: 0.5 },
-  waitingHost: { marginTop: 'auto', textAlign: 'center', color: colors.textMuted, fontSize: 16 },
-  error: { color: colors.wrong, marginTop: 16, textAlign: 'center' },
+  avatarText: { fontSize: 28, fontWeight: '900', color: colors.accentPressed },
+  waitingRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
+  waiting: { ...type.body, color: colors.inkMuted },
+  joinedLabel: { ...type.label, color: colors.inkMuted },
+  joinedName: { ...type.title },
+  spacer: { flex: 1 },
+  waitingHost: { ...type.body, textAlign: 'center', color: colors.inkMuted },
+  error: { ...type.body, color: colors.danger, marginTop: spacing.md, textAlign: 'center' },
 });

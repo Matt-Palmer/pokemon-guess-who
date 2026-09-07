@@ -18,8 +18,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { DrawCeremony } from '@/components/match/DrawCeremony';
 import { GuessReveal } from '@/components/match/GuessReveal';
-import { Tile } from '@/components/match/Tile';
-import { typeColors } from '@/constants/colors';
+import { Tile, TileView } from '@/components/match/Tile';
 import { claimState, formatRemaining } from '@/lib/game/claim';
 import { guessedSecretId, shouldPlayGuessReveal } from '@/lib/game/reveal';
 import { pairThread, splitByMarks } from '@/lib/game/review';
@@ -45,6 +44,11 @@ import { useSupabase } from '@/lib/supabase';
 import { Badge, Button, CardModal, Screen, TextField, colors, radii, shadows, spacing, type } from '@/ui';
 
 const BOARD_COLUMNS = 4;
+
+/** Floating chat-bubble diameter. The board reserves this much clear space at
+ *  the bottom so the bubble never sits on top of the last tile (ADR 0001: all
+ *  24 tiles must stay visible). */
+const BUBBLE_SIZE = 60;
 
 /** Pokémon names arrive lowercase; tiles capitalize via CSS, prose can't. */
 const displayName = (name: string) => name.charAt(0).toUpperCase() + name.slice(1);
@@ -172,6 +176,34 @@ function BoardGrid({
   );
 }
 
+/** Segmented control for the board-wide facet view: Pokémon · Type · Region. */
+function ViewToggle({ value, onChange }: { value: TileView; onChange: (v: TileView) => void }) {
+  const options: { key: TileView; label: string }[] = [
+    { key: 'pokemon', label: 'Pokémon' },
+    { key: 'type', label: 'Type' },
+    { key: 'region', label: 'Region' },
+  ];
+  return (
+    <View style={styles.viewToggle}>
+      {options.map((o) => {
+        const active = o.key === value;
+        return (
+          <Pressable
+            key={o.key}
+            style={[styles.viewOption, active && styles.viewOptionActive]}
+            onPress={() => onChange(o.key)}
+            accessibilityRole="button"
+            accessibilityState={{ selected: active }}>
+            <Text style={[styles.viewOptionText, active && styles.viewOptionTextActive]}>
+              {o.label}
+            </Text>
+          </Pressable>
+        );
+      })}
+    </View>
+  );
+}
+
 export default function MatchScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const { user } = useUser();
@@ -184,7 +216,7 @@ export default function MatchScreen() {
   const { marks, toggle: toggleMark } = useBoardMarks(id);
   const players = useMatchPlayers(id);
   const result = useMatchResult(id, match?.status === 'completed');
-  const [selected, setSelected] = useState<PokemonCard | null>(null);
+  const [view, setView] = useState<TileView>('pokemon');
   const [drawing, setDrawing] = useState(false);
   const [drawError, setDrawError] = useState<string | null>(null);
   const [input, setInput] = useState('');
@@ -652,6 +684,8 @@ export default function MatchScreen() {
       )}
       {!guessMode && claimUi}
 
+      <ViewToggle value={view} onChange={setView} />
+
       <BoardGrid
         cards={cards}
         renderTile={(card, index) => (
@@ -665,11 +699,16 @@ export default function MatchScreen() {
             mine={card.id === mySecretId}
             targeted={guessTarget?.id === card.id}
             shakeNonce={shake?.cardId === card.id ? shake.nonce : 0}
+            view={view}
             onPress={() => onCardPress(card)}
-            onLongPress={() => setSelected(card)}
           />
         )}
       />
+
+      {/* Reserve a clear band below the grid so the floating chat bubble never
+          covers the last tile — the board still shows all 24 and never scrolls
+          (ADR 0001). Guess mode swaps in its own bottom bar instead. */}
+      {!guessMode && <View style={{ height: insets.bottom + spacing.lg + BUBBLE_SIZE }} />}
 
       {guessMode && (
         // Guess confirm bar: the one flow that stays on the board.
@@ -835,32 +874,6 @@ export default function MatchScreen() {
         </ScrollView>
       </CardModal>
 
-      {/* Tile details (long-press). */}
-      <CardModal visible={selected !== null} onClose={() => setSelected(null)}>
-        {selected && (
-          <View style={styles.detailRow}>
-            <Image
-              source={{ uri: selected.sprite_url }}
-              style={styles.detailSprite}
-              contentFit="contain"
-            />
-            <View style={styles.detailInfo}>
-              <Text style={styles.detailName}>{selected.name}</Text>
-              <View style={styles.typeRow}>
-                {selected.types.map((t) => (
-                  <View
-                    key={t}
-                    style={[styles.typeChip, { backgroundColor: typeColors[t] ?? colors.inkMuted }]}>
-                    <Text style={styles.typeChipText}>{t}</Text>
-                  </View>
-                ))}
-              </View>
-              <Text style={styles.detailGen}>Generation {selected.generation}</Text>
-            </View>
-          </View>
-        )}
-      </CardModal>
-
       {/* A second drawer's ceremony rides the draw → active switch; the
           guesser's reveal starts here, before the completed row lands. */}
       {ceremonyUi}
@@ -916,8 +929,8 @@ const styles = StyleSheet.create({
   bubble: {
     position: 'absolute',
     right: spacing.lg,
-    width: 60,
-    height: 60,
+    width: BUBBLE_SIZE,
+    height: BUBBLE_SIZE,
     borderRadius: radii.pill,
     backgroundColor: colors.primary,
     borderWidth: 2,
@@ -1035,15 +1048,20 @@ const styles = StyleSheet.create({
   reviewQuestion: { ...type.body, marginTop: 2 },
   reviewAnswer: { ...type.body, fontWeight: '700', marginTop: spacing.xs },
 
-  // Tile details
-  detailRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.lg },
-  detailSprite: { width: 72, height: 72 },
-  detailInfo: { flex: 1 },
-  detailName: { ...type.title, textTransform: 'capitalize' },
-  typeRow: { flexDirection: 'row', gap: spacing.xs + 2, marginTop: spacing.xs + 2 },
-  typeChip: { borderRadius: radii.pill, paddingVertical: 3, paddingHorizontal: spacing.sm + 2 },
-  typeChipText: { color: colors.onPrimary, fontWeight: '700', fontSize: 12, textTransform: 'capitalize' },
-  detailGen: { ...type.caption, marginTop: spacing.xs + 2, fontWeight: '600' },
+  // View toggle (segmented control)
+  viewToggle: {
+    flexDirection: 'row',
+    marginHorizontal: spacing.md,
+    marginTop: spacing.sm,
+    backgroundColor: colors.surfaceSunken,
+    borderRadius: radii.pill,
+    padding: 3,
+    gap: 3,
+  },
+  viewOption: { flex: 1, alignItems: 'center', paddingVertical: spacing.xs + 2, borderRadius: radii.pill },
+  viewOptionActive: { backgroundColor: colors.primary, ...shadows.card },
+  viewOptionText: { fontSize: 12, fontWeight: '800', color: colors.inkMuted },
+  viewOptionTextActive: { color: colors.onPrimary },
 
   // End screen
   endPanel: { alignItems: 'center', justifyContent: 'center' },

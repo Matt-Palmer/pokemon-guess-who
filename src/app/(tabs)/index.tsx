@@ -1,15 +1,15 @@
 import { useUser } from '@clerk/clerk-expo';
 import { useFocusEffect, useRouter } from 'expo-router';
-import { useCallback } from 'react';
-import { ActivityIndicator, FlatList, Pressable, StyleSheet, Text, View } from 'react-native';
+import { useCallback, useMemo, useState } from 'react';
+import { ActivityIndicator, FlatList, StyleSheet, Text, View } from 'react-native';
 
-import { colors } from '@/constants/colors';
+import { PartyModal } from '@/components/home/PartyModal';
 import { summarizeTurn, TurnKind } from '@/lib/game/summary';
 import { MyMatchRow, useMyMatches, useOnlinePlayers } from '@/lib/matches';
-import { usePushRegistration } from '@/lib/notifications';
 import { useProfile } from '@/lib/profile';
+import { Badge, Button, Card, Screen, colors, radii, spacing, type } from '@/ui';
 
-/** Copy for each turn state; `opponent` is the display name (never null once needed). */
+/** Whose-move copy for each turn state; `opponent` is the display name. */
 function turnCopy(kind: TurnKind, opponent: string): string {
   switch (kind) {
     case 'waiting_for_opponent':
@@ -19,20 +19,37 @@ function turnCopy(kind: TurnKind, opponent: string): string {
     case 'waiting_for_host':
       return `Waiting for ${opponent} to start`;
     case 'your_draw':
-      return 'Your move — draw your secret';
+      return 'Draw your secret';
     case 'their_draw':
       return `Waiting for ${opponent} to draw`;
     case 'your_question':
-      return 'Your move — ask or guess';
+      return 'Ask or guess';
     case 'their_question':
       return `${opponent}'s turn to ask`;
     case 'your_answer':
-      return `Your move — answer ${opponent}'s question`;
+      return 'Answer their question';
     case 'their_answer':
       return `Waiting for ${opponent} to answer`;
     case 'finished':
       return 'Finished';
   }
+}
+
+/** A short phase chip label, derived from the match row (blind draw vs play). */
+function phaseLabel(match: MyMatchRow): string {
+  if (match.status === 'lobby') return 'Lobby';
+  if (!match.player1_drawn || !match.player2_drawn) return 'Blind draw';
+  return 'Playing';
+}
+
+/** A round game-piece avatar: opponent emoji/initial, or a waiting glyph for an open party. */
+function Avatar({ emoji, name, waiting }: { emoji?: string | null; name?: string; waiting?: boolean }) {
+  const label = waiting ? '⏳' : emoji || name?.charAt(0).toUpperCase() || '?';
+  return (
+    <View style={styles.avatar}>
+      <Text style={styles.avatarText}>{label}</Text>
+    </View>
+  );
 }
 
 export default function GamesScreen() {
@@ -41,10 +58,7 @@ export default function GamesScreen() {
   const { matches, loading, error, refetch } = useMyMatches();
   const online = useOnlinePlayers(user?.id);
   const router = useRouter();
-
-  // Home is the first signed-in screen and useProfile guarantees the row
-  // exists, so this is where the install registers its push token.
-  usePushRegistration(profile);
+  const [partyOpen, setPartyOpen] = useState(false);
 
   // The tab stays mounted while playing; re-read the list whenever it regains
   // focus so finished/advanced games are reflected even if a Realtime refetch
@@ -54,6 +68,16 @@ export default function GamesScreen() {
       refetch();
     }, [refetch]),
   );
+
+  // Games you owe a move sort to the top; within each group the RPC's
+  // most-recently-active ordering is preserved (stable sort).
+  const ordered = useMemo(() => {
+    if (!user) return matches;
+    return matches
+      .map((m, i) => ({ m, i, myMove: summarizeTurn(m, user.id).myMove }))
+      .sort((a, b) => (a.myMove === b.myMove ? a.i - b.i : a.myMove ? -1 : 1))
+      .map((x) => x.m);
+  }, [matches, user]);
 
   const openGame = (game: MyMatchRow) => {
     // Resuming is just navigation: every match screen rehydrates its state
@@ -67,37 +91,36 @@ export default function GamesScreen() {
     const opponentId = item.player1_id === user.id ? item.player2_id : item.player1_id;
     const opponentName = item.opponent_username ?? 'Opponent';
     const opponentOnline = Boolean(opponentId && online.has(opponentId));
+    const openLobby = !item.player2_id;
 
     return (
-      <Pressable style={[styles.gameRow, myMove && styles.gameRowMyMove]} onPress={() => openGame(item)}>
+      <Card
+        onPress={() => openGame(item)}
+        style={StyleSheet.flatten([styles.gameCard, myMove && styles.gameCardMyMove])}>
+        <Avatar emoji={item.opponent_avatar} name={opponentName} waiting={openLobby} />
         <View style={styles.gameInfo}>
-          <View style={styles.opponentRow}>
-            <Text style={styles.opponentName}>
-              {item.player2_id ? `vs ${opponentName}` : `Party ${item.party_code}`}
+          <View style={styles.nameRow}>
+            <Text style={styles.opponentName} numberOfLines={1}>
+              {openLobby ? `Party ${item.party_code}` : opponentName}
             </Text>
-            {opponentOnline && (
-              <View style={styles.onlineChip}>
-                <View style={styles.onlineDot} />
-                <Text style={styles.onlineText}>online</Text>
-              </View>
-            )}
+            {opponentOnline && <View style={styles.onlineDot} />}
+            <View style={styles.flexSpacer} />
+            {myMove && <Badge label="Your move" variant="primary" />}
           </View>
-          <Text style={[styles.turnLabel, myMove && styles.turnLabelMyMove]}>
-            {turnCopy(kind, opponentName)}
-          </Text>
+          <View style={styles.metaRow}>
+            <Badge label={phaseLabel(item)} variant="neutral" />
+            <Text style={[styles.turnLabel, myMove && styles.turnLabelMyMove]} numberOfLines={1}>
+              {turnCopy(kind, opponentName)}
+            </Text>
+          </View>
         </View>
-        {myMove && (
-          <View style={styles.myMoveBadge}>
-            <Text style={styles.myMoveBadgeText}>Your move</Text>
-          </View>
-        )}
-      </Pressable>
+      </Card>
     );
   };
 
   return (
-    <View style={styles.container}>
-      <Text style={styles.title}>Welcome, {profile?.username}</Text>
+    <Screen>
+      <Text style={styles.title}>Hi, {profile?.username ?? 'Trainer'}</Text>
 
       {loading ? (
         <View style={styles.center}>
@@ -105,64 +128,78 @@ export default function GamesScreen() {
         </View>
       ) : (
         <FlatList
-          data={matches}
+          data={ordered}
           keyExtractor={(m) => m.id}
           renderItem={renderGame}
           contentContainerStyle={styles.list}
+          showsVerticalScrollIndicator={false}
           ListEmptyComponent={
-            <Text style={styles.empty}>
-              {error ?? 'No active games yet — start one below.'}
-            </Text>
+            <View style={styles.empty}>
+              <Text style={styles.emptyGlyph}>◓</Text>
+              <Text style={styles.emptyTitle}>No games yet</Text>
+              <Text style={styles.emptyBody}>
+                {error ?? 'Start a game with a friend, or get matched with a random opponent.'}
+              </Text>
+            </View>
           }
         />
       )}
 
-      <Pressable style={styles.button} onPress={() => router.push('/new-game')}>
-        <Text style={styles.buttonText}>New Game</Text>
-      </Pressable>
-    </View>
+      <View style={styles.actions}>
+        <Button
+          title="Play a friend"
+          onPress={() => setPartyOpen(true)}
+          style={styles.actionButton}
+        />
+        <Button
+          title="Random opponent"
+          variant="accent"
+          onPress={() => router.push('/matchmaking')}
+          style={styles.actionButton}
+        />
+      </View>
+
+      <PartyModal
+        visible={partyOpen}
+        onClose={() => setPartyOpen(false)}
+        onEnterLobby={(matchId) => {
+          setPartyOpen(false);
+          router.push(`/lobby/${matchId}`);
+        }}
+      />
+    </Screen>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, padding: 24, backgroundColor: colors.background },
+  title: { ...type.display, marginBottom: spacing.lg },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
-  title: { fontSize: 20, fontWeight: '700', color: colors.text, marginBottom: 16 },
-  list: { flexGrow: 1 },
-  empty: { color: colors.textMuted, textAlign: 'center', marginTop: 48 },
-  gameRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: colors.card,
-    borderRadius: 14,
+  list: { flexGrow: 1, gap: spacing.md, paddingBottom: spacing.md },
+  gameCard: { flexDirection: 'row', alignItems: 'center', gap: spacing.md },
+  gameCardMyMove: { borderColor: colors.primary, borderWidth: 2, backgroundColor: colors.primarySoft },
+  avatar: {
+    width: 44,
+    height: 44,
+    borderRadius: radii.pill,
+    backgroundColor: colors.accentSoft,
     borderWidth: 1.5,
-    borderColor: colors.border,
-    padding: 16,
-    marginBottom: 10,
-  },
-  gameRowMyMove: { borderColor: colors.primary, backgroundColor: colors.primaryBg },
-  gameInfo: { flex: 1 },
-  opponentRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  opponentName: { fontSize: 16, fontWeight: '700', color: colors.text },
-  onlineChip: { flexDirection: 'row', alignItems: 'center', gap: 4 },
-  onlineDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: colors.correct },
-  onlineText: { fontSize: 11, color: colors.correct, fontWeight: '600' },
-  turnLabel: { marginTop: 3, fontSize: 13, color: colors.textMuted },
-  turnLabelMyMove: { color: colors.primaryDark, fontWeight: '600' },
-  myMoveBadge: {
-    backgroundColor: colors.primary,
-    borderRadius: 8,
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-    marginLeft: 12,
-  },
-  myMoveBadgeText: { color: colors.onPrimary, fontWeight: '800', fontSize: 12 },
-  button: {
-    backgroundColor: colors.primary,
-    borderRadius: 12,
-    padding: 16,
+    borderColor: colors.accent,
     alignItems: 'center',
-    marginTop: 12,
+    justifyContent: 'center',
   },
-  buttonText: { color: colors.onPrimary, fontWeight: '700', fontSize: 16 },
+  avatarText: { fontSize: 20, fontWeight: '900', color: colors.accentPressed },
+  gameInfo: { flex: 1, gap: spacing.xs },
+  nameRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
+  opponentName: { ...type.heading, flexShrink: 1 },
+  onlineDot: { width: 9, height: 9, borderRadius: 5, backgroundColor: colors.success },
+  flexSpacer: { flex: 1 },
+  metaRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
+  turnLabel: { ...type.caption, flexShrink: 1 },
+  turnLabelMyMove: { color: colors.primary, fontWeight: '700' },
+  empty: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: spacing.sm, padding: spacing.xl },
+  emptyGlyph: { fontSize: 56, color: colors.primary, marginBottom: spacing.xs },
+  emptyTitle: { ...type.title },
+  emptyBody: { ...type.body, color: colors.inkMuted, textAlign: 'center' },
+  actions: { flexDirection: 'row', gap: spacing.md, paddingTop: spacing.md },
+  actionButton: { flex: 1 },
 });

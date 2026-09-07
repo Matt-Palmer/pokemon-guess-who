@@ -30,7 +30,9 @@ export default function ProfileScreen() {
   if (error || !profile) {
     return (
       <Screen style={styles.center}>
-        <Text style={styles.error}>{error ?? 'Profile not found'}</Text>
+        <Card style={styles.errorCard}>
+          <Text style={styles.errorText}>{error ?? 'Profile not found'}</Text>
+        </Card>
       </Screen>
     );
   }
@@ -39,6 +41,7 @@ export default function ProfileScreen() {
 
   return (
     <Screen>
+      {/* Identity as a game piece: avatar in a ringed disc + record subtitle. */}
       <Card style={styles.playerCard}>
         <View style={styles.avatar}>
           <Text style={styles.avatarText}>
@@ -46,15 +49,18 @@ export default function ProfileScreen() {
           </Text>
         </View>
         <Text style={styles.username}>{profile.username}</Text>
+        <Text style={styles.record}>
+          {profile.wins}W · {profile.losses}L · {winRate}% win rate
+        </Text>
       </Card>
 
       <View style={styles.statsGrid}>
-        <Stat label="Played" value={profile.games_played} />
-        <Stat label="Wins" value={profile.wins} />
-        <Stat label="Losses" value={profile.losses} />
-        <Stat label="Win rate" value={`${winRate}%`} />
-        <Stat label="Streak" value={profile.current_streak} />
-        <Stat label="Best streak" value={profile.best_streak} />
+        <Stat glyph="🎮" label="Played" value={profile.games_played} />
+        <Stat glyph="🏆" label="Wins" value={profile.wins} accent />
+        <Stat glyph="💀" label="Losses" value={profile.losses} />
+        <Stat glyph="🎯" label="Win rate" value={`${winRate}%`} />
+        <Stat glyph="🔥" label="Streak" value={profile.current_streak} accent />
+        <Stat glyph="⭐" label="Best streak" value={profile.best_streak} />
       </View>
 
       <View style={styles.spacer} />
@@ -63,9 +69,20 @@ export default function ProfileScreen() {
   );
 }
 
-function Stat({ label, value }: { label: string; value: string | number }) {
+function Stat({
+  glyph,
+  label,
+  value,
+  accent,
+}: {
+  glyph: string;
+  label: string;
+  value: string | number;
+  accent?: boolean;
+}) {
   return (
-    <Card style={styles.stat}>
+    <Card style={StyleSheet.flatten([styles.stat, accent && styles.statAccent])}>
+      <Text style={styles.statGlyph}>{glyph}</Text>
       <Text style={styles.statValue}>{value}</Text>
       <Text style={styles.statLabel}>{label}</Text>
     </Card>
@@ -74,19 +91,21 @@ function Stat({ label, value }: { label: string; value: string | number }) {
 
 const styles = StyleSheet.create({
   center: { alignItems: 'center', justifyContent: 'center' },
-  playerCard: { alignItems: 'center', gap: spacing.sm, marginBottom: spacing.lg },
+  playerCard: { alignItems: 'center', gap: spacing.xs, marginBottom: spacing.lg },
   avatar: {
-    width: 64,
-    height: 64,
+    width: 80,
+    height: 80,
     borderRadius: radii.pill,
     backgroundColor: colors.accentSoft,
-    borderWidth: 1.5,
+    borderWidth: 2.5,
     borderColor: colors.accent,
     alignItems: 'center',
     justifyContent: 'center',
+    marginBottom: spacing.xs,
   },
-  avatarText: { fontSize: 28, fontWeight: '900', color: colors.accentPressed },
-  username: { ...type.title },
+  avatarText: { fontSize: 36, fontWeight: '900', color: colors.accentPressed },
+  username: { ...type.display },
+  record: { ...type.caption, fontWeight: '700' },
   statsGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
@@ -99,8 +118,11 @@ const styles = StyleSheet.create({
     padding: spacing.md,
     gap: spacing.xs,
   },
-  statValue: { fontSize: 22, fontWeight: '900', color: colors.primary },
+  statAccent: { backgroundColor: colors.accentSoft, borderColor: colors.accent },
+  statGlyph: { fontSize: 24 },
+  statValue: { fontSize: 24, fontWeight: '900', color: colors.primary },
   statLabel: { ...type.caption, fontWeight: '700' },
   spacer: { flex: 1 },
-  error: { ...type.body, color: colors.danger },
+  errorCard: { alignItems: 'center' },
+  errorText: { ...type.body, color: colors.danger, textAlign: 'center' },
 });

@@ -1,27 +1,36 @@
 import { Image } from 'expo-image';
-import { useCallback, useEffect } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import Animated, {
+  runOnJS,
   useAnimatedStyle,
   useReducedMotion,
   useSharedValue,
+  withDelay,
   withSequence,
   withSpring,
   withTiming,
   ZoomIn,
 } from 'react-native-reanimated';
 
+import { typeColors } from '@/constants/colors';
+import { regionForGeneration } from '@/constants/regions';
 import { PokemonCard } from '@/lib/matches';
-import { CardBack, colors, dealDelay, FlipCard, radii, shadows, spacing } from '@/ui';
+import { CardBack, colors, dealDelay, FlipCard, motion, radii, shadows, spacing } from '@/ui';
 
 const AnimatedPressable = Animated.createAnimatedComponent(Pressable);
+
+/** Which facet the face shows — the board's shared view mode. */
+export type TileView = 'pokemon' | 'type' | 'region';
 
 type Props = {
   card: PokemonCard;
   /** Face-down = crossed off in play, undrawn in the blind draw. */
   faceDown: boolean;
-  /** Board position, for the deal-in stagger. */
+  /** Board position, for the deal-in and view-change staggers. */
   dealIndex: number;
+  /** Which facet the face shows (Pokémon sprite / type / region). */
+  view?: TileView;
   /** Your own secret: accent border face-up... */
   mine?: boolean;
   /** ...or a ★ on the back while the board is face-down in the draw. */
@@ -32,8 +41,94 @@ type Props = {
   /** Increment to play the wrong-guess sympathy shake. */
   shakeNonce?: number;
   onPress: () => void;
-  onLongPress?: () => void;
 };
+
+/** The Pokédex number as a padded `#025`. */
+const dexNumber = (id: number) => `#${String(id).padStart(3, '0')}`;
+
+/**
+ * The face-up content: the Pokédex number (corner) and name (bottom) stay put in
+ * every view; only the hero swaps — sprite ↔ type chips ↔ region name. Changing
+ * `view` turns the face over (a half-flip out/in), staggered across the board by
+ * `dealIndex` so the change ripples like a wave. Reduced motion swaps instantly.
+ */
+function TileFace({
+  card,
+  view,
+  mine,
+  targeted,
+  dealIndex,
+}: {
+  card: PokemonCard;
+  view: TileView;
+  mine?: boolean;
+  targeted?: boolean;
+  dealIndex: number;
+}) {
+  const reduced = useReducedMotion();
+  // The facet actually rendered — lags `view` until the face is edge-on, so the
+  // swap is hidden mid-flip.
+  const [shown, setShown] = useState<TileView>(view);
+  const spin = useSharedValue(0);
+
+  useEffect(() => {
+    if (view === shown) return;
+    if (reduced) {
+      setShown(view);
+      return;
+    }
+    const half = motion.flip / 2;
+    // Turn edge-on, swap the hero while it's hidden, then turn back to face.
+    spin.value = withDelay(
+      dealDelay(dealIndex),
+      withSequence(
+        withTiming(90, { duration: half }, (finished) => {
+          if (finished) runOnJS(setShown)(view);
+        }),
+        withTiming(0, { duration: half }),
+      ),
+    );
+  }, [view, shown, reduced, dealIndex, spin]);
+
+  const spinStyle = useAnimatedStyle(() => ({
+    transform: [{ perspective: 800 }, { rotateY: `${spin.value}deg` }],
+  }));
+
+  return (
+    <Animated.View
+      style={[styles.face, mine && styles.faceMine, targeted && styles.faceTargeted, spinStyle]}>
+      <Text style={styles.dex}>{dexNumber(card.id)}</Text>
+
+      <View style={styles.hero}>
+        {shown === 'pokemon' && (
+          <Image source={{ uri: card.sprite_url }} style={styles.sprite} contentFit="contain" />
+        )}
+        {shown === 'type' && (
+          <View style={styles.typeStack}>
+            {card.types.map((t) => (
+              <View key={t} style={[styles.typeChip, { backgroundColor: typeColors[t] ?? colors.inkMuted }]}>
+                <Text style={styles.typeChipText} numberOfLines={1}>
+                  {t}
+                </Text>
+              </View>
+            ))}
+          </View>
+        )}
+        {shown === 'region' && (
+          <View style={styles.regionPanel}>
+            <Text style={styles.regionText} numberOfLines={1} adjustsFontSizeToFit>
+              {regionForGeneration(card.generation)}
+            </Text>
+          </View>
+        )}
+      </View>
+
+      <Text style={styles.name} numberOfLines={1}>
+        {card.name}
+      </Text>
+    </Animated.View>
+  );
+}
 
 /**
  * One board tile as a physical piece: deals in with the board wave, squishes
@@ -46,13 +141,13 @@ export function Tile({
   card,
   faceDown,
   dealIndex,
+  view = 'pokemon',
   mine,
   backMark,
   targeted,
   disabled,
   shakeNonce,
   onPress,
-  onLongPress,
 }: Props) {
   const reduced = useReducedMotion();
   const pressed = useSharedValue(0);
@@ -89,19 +184,11 @@ export function Tile({
       disabled={disabled}
       onPress={onPress}
       onPressIn={onPressIn}
-      onPressOut={onPressOut}
-      onLongPress={onLongPress}>
+      onPressOut={onPressOut}>
       <FlipCard
         flipped={faceDown}
         style={styles.flip}
-        front={
-          <View style={[styles.face, mine && styles.faceMine, targeted && styles.faceTargeted]}>
-            <Image source={{ uri: card.sprite_url }} style={styles.sprite} contentFit="contain" />
-            <Text style={styles.name} numberOfLines={1}>
-              {card.name}
-            </Text>
-          </View>
-        }
+        front={<TileFace card={card} view={view} mine={mine} targeted={targeted} dealIndex={dealIndex} />}
         back={
           <>
             <CardBack />
@@ -133,7 +220,34 @@ const styles = StyleSheet.create({
     borderWidth: 3,
     backgroundColor: colors.successSoft,
   },
+  dex: {
+    position: 'absolute',
+    top: 3,
+    left: 5,
+    fontSize: 8,
+    fontWeight: '800',
+    color: colors.inkFaint,
+  },
+  hero: { flex: 1, width: '100%', alignItems: 'center', justifyContent: 'center' },
   sprite: { width: '100%', flex: 1 },
+  typeStack: { gap: 3, alignItems: 'stretch', width: '100%', paddingHorizontal: 2 },
+  typeChip: {
+    borderRadius: radii.pill,
+    paddingVertical: 2,
+    paddingHorizontal: spacing.xs,
+    alignItems: 'center',
+  },
+  typeChipText: { color: colors.onPrimary, fontWeight: '800', fontSize: 9, textTransform: 'capitalize' },
+  regionPanel: {
+    backgroundColor: colors.accentSoft,
+    borderRadius: radii.sm,
+    borderWidth: 1.5,
+    borderColor: colors.accent,
+    paddingVertical: spacing.xs,
+    paddingHorizontal: spacing.sm,
+    maxWidth: '100%',
+  },
+  regionText: { color: colors.accentPressed, fontWeight: '900', fontSize: 12, textAlign: 'center' },
   name: {
     fontSize: 10,
     fontWeight: '600',

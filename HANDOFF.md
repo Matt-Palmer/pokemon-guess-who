@@ -1,4 +1,4 @@
-# Pokémon Guess Who — Handoff (Issue 14 complete: UI/UX redesign underway — issues 15–16 remain)
+# Pokémon Guess Who — Handoff (Issue 16 complete: UI/UX redesign done — all 16 issues shipped)
 
 **Project:** `/Users/Matt/Dev/pokemon-guess-who` — Expo/expo-router + Clerk auth + Supabase (Postgres + Realtime).
 Supabase project ref `azaemyxdzapolhqmcwpq`. Issues live in `issues/`, spec in `PRD.md`.
@@ -270,13 +270,66 @@ Supabase project ref `azaemyxdzapolhqmcwpq`. Issues live in `issues/`, spec in `
     win/loss end screens with correct secrets. Not smoke-tested on a real device (60fps/worklet behavior is
     native-only — worth a look when device testing happens).
 
+- **Issue 15** (home + starting a game): presentation-only; no reducer/RPC/DB changes. Game-starting now folds
+  into the home screen and the separate `new-game` route is gone. Verified live in the web preview at iPhone SE
+  size (375×667) signed in as `rlstest1`.
+  - **Home** (`src/app/(tabs)/index.tsx`) rewritten onto `@/ui`: welcome header + two labeled start paths
+    pinned at the bottom — **"Play a friend"** (opens the party modal) and **"Random opponent"**
+    (→ `/matchmaking`). Richer game cards via `Card`: round game-piece avatar (opponent emoji/initial, ⏳ for an
+    open party seat), opponent name (or `Party <code>` while the seat is open), phase Badge (`Lobby` / `Blind
+    draw` / `Playing`, derived from the row), terse whose-move copy, a green online dot from `useOnlinePlayers`,
+    and a strong **"Your move"** treatment — primary Badge on the name row + highlighted border + soft
+    background, and those games **sort to the top** (stable sort keyed on `summarizeTurn(...).myMove`, preserving
+    the RPC's activity order within each group). Inviting empty state (poké-ball glyph + copy) replaces the old
+    text line. Hooks (`useMyMatches`/`useOnlinePlayers`) consumed unchanged.
+  - **`src/components/home/PartyModal.tsx`** (new): the old new-game create/join folded into a shared
+    `CardModal` over home — "Start a party" (`createParty`) + join-by-code (`joinParty`, 6-char validation),
+    busy/error states, non-dismissable mid-request; on success routes into `/lobby/[id]`. **`src/app/new-game.tsx`
+    deleted** and its `Stack.Screen` removed from `_layout.tsx`.
+  - **Lobby** (`src/app/lobby/[id].tsx`) + **matchmaking** (`src/app/matchmaking.tsx`) restyled onto `@/ui`
+    (`Screen`/`Card`/`Button`, avatars), flows unchanged: party code + copy + start (host) / waiting (joiner);
+    searching spinner + working Cancel, opponent-found confirmation. Also migrated `_layout.tsx` and
+    `(tabs)/_layout.tsx` off the deprecated `constants/colors` — the only remaining chrome consumers are the auth
+    screens (issue 16); `typeColors` (content) stays.
+  - **103/103 unit tests pass**, `tsc` clean, lint clean. Integration suites untouched (presentation-only).
+    Verified live: rich cards + your-move sort/emphasis, party modal (create/join UI + empty-code validation),
+    matchmaking searching→cancel (`matchmaking_queue` confirmed empty afterward), and a real lobby (code/copy/
+    opponent/Start) opened from an existing lobby card. ⚠️ Not visually verified: the **empty state** (couldn't
+    stage an empty list without deleting the ~44 live test matches on `rlstest1`) — code path is trivial JSX.
+    Not smoke-tested on a real device. Did not exercise create/start/join *writes* (would mutate live test data;
+    those RPCs are unchanged and integration-tested).
+
+- **Issue 16** (auth screens + profile as a player card — final redesign issue): presentation-only; no
+  reducer/RPC/DB changes. Clerk logic (`useSignIn`/`useSignUp`), `useProfile`, and stats derivation consumed
+  as-is. Verified live in the web preview at iPhone SE size (375×667).
+  - **`src/components/auth/AuthBrand.tsx`** (new): the shared board-game brand header — a poké-ball mark built
+    from plain Views (content over chrome, same house rule as `CardBack`) + "Guess Who" wordmark + per-screen
+    subtitle. Used by both auth screens and all their sub-states.
+  - **Sign-in / sign-up** (`src/app/(auth)/*.tsx`) rewritten onto `@/ui`: `Screen` + `KeyboardAvoidingView` +
+    centered `ScrollView`, `AuthBrand`, the form in a `Card` of `TextField`s, a **themed error box**
+    (`dangerSoft` well, not red text on white), and the submit `Button` carries a `busy` spinner + `disabled`
+    until Clerk `isLoaded`. Verification / second-factor states reuse the same scaffold. Sign-up keeps the
+    web-only `#clerk-captcha` mount point.
+  - **Profile** (`src/app/(tabs)/profile.tsx`) elevated to a player card: larger ringed avatar disc + a
+    `16W · 18L · 47% win rate` record subtitle, and the six stats as **achievement tiles** (emoji glyph + value
+    + label; Wins and Streak get the accent treatment). Values still from `useProfile` + `winRatePercent`.
+    Error state now a themed `Card`, sign-out stays the quiet demoted action.
+  - **`constants/colors.ts`**: the deprecated `colors` alias is **deleted** — the auth screens were its last
+    chrome consumers, so every screen now imports `@/ui` directly. `typeColors` (game content) stays.
+  - **88/88 game unit tests pass**, `tsc` clean, lint clean. Integration suites untouched (presentation-only).
+    Verified live: profile player card + achievement tiles (rlstest1's real 34/16/18 stats), and both auth
+    screens (poké-ball mark, wordmark, sunken inputs, 3D button, themed link) — viewed by temporarily
+    bypassing the signed-in→redirect guard in `(auth)/_layout.tsx` (reverted; redirect re-confirmed working),
+    since the Clerk test users have no form password to sign back in with. No console errors. Not smoke-tested
+    on a real device.
+
 ## Next steps
 
-Issues 1–14 are complete. **Redesign issues remain: 15 (home + new-game flow), 16 (auth + player card)** —
-specs in `issues/`. Other known gaps, in rough priority order:
+**All 16 issues are complete — `issues/` is fully shipped (core game 1–11 + UI/UX redesign 12–16).**
+Other known gaps, in rough priority order:
 
-- **Device smoke tests**: Issues 7, 8, 10, 11 and the redesign (12–14) have never been exercised on a real
-  device (need two players mid-match). The full flows are integration-tested against the live DB, and 12–14
+- **Device smoke tests**: Issues 7, 8, 10, 11 and the redesign (12–16) have never been exercised on a real
+  device (need two players mid-match). The full flows are integration-tested against the live DB, and 12–16
   were exercised in the web preview.
 - **Real push delivery**: needs `eas init` (EAS projectId) + a development build — see the gotcha below. The
   entire server pipeline is already live and verified on the wire.
@@ -286,6 +339,19 @@ specs in `issues/`. Other known gaps, in rough priority order:
 
 ## Gotchas for the new session
 
+- **A free-plan Supabase project pauses after ~7 days idle**, and while paused its hostname stops resolving
+  (NXDOMAIN) — so every call fails as a bare `TypeError: Failed to fetch` with no HTTP status. Recognise it by
+  the shape: instant failure, *every* request, not one endpoint. `get_project` reports `status: "INACTIVE"`;
+  MCP `restore_project` brings it back in ~5 minutes. Reload the app afterwards — the Realtime socket does not
+  recover from an outage that long.
+- **A profile row is guaranteed server-side** (migration 00015). `matches.player1_id/player2_id` and
+  `matchmaking_queue.user_id` are FKs onto `profiles(clerk_id)`, and the row used to be created *only* by
+  `useProfile`'s unretried client insert — so a blip during sign-up (or a paused project, which is how this was
+  found) left a signed-in account permanently unable to start a game, failing with a raw
+  `matches_player1_id_fkey`. `create_party` / `join_party` / `find_random_game` now `perform ensure_profile()`
+  first. **The Clerk session JWT carries only `sub`** — no username or email claim — so the server writes a
+  `'Trainer'` placeholder and `useProfile` reconciles it to the real Clerk name on next load. Any *new* RPC that
+  writes one of those FK columns must call `ensure_profile()` too; it is deliberately not client-executable.
 - **Motion is presentation only** (issue 14 house rule): animations follow already-written state (`FlipCard`'s
   `flipped` prop, the status edge) and must never gate or reorder game writes. Known cosmetic artifact: the
   *guesser's* `GuessReveal` remounts when the row flips to `completed` (the phase branches return different

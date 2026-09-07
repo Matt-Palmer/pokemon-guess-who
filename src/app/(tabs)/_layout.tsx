@@ -1,7 +1,7 @@
 import { useAuth } from '@clerk/clerk-expo';
 import { Redirect, Tabs } from 'expo-router';
 
-import { colors } from '@/constants/colors';
+import { colors } from '@/ui';
 
 export default function TabsLayout() {
   const { isLoaded, isSignedIn } = useAuth();
@@ -13,8 +13,8 @@ export default function TabsLayout() {
     <Tabs
       screenOptions={{
         tabBarActiveTintColor: colors.primary,
-        tabBarInactiveTintColor: colors.textMuted,
-        tabBarStyle: { backgroundColor: colors.card, borderTopColor: colors.border },
+        tabBarInactiveTintColor: colors.inkMuted,
+        tabBarStyle: { backgroundColor: colors.surface, borderTopColor: colors.border },
         headerStyle: { backgroundColor: colors.primary },
         headerTintColor: colors.onPrimary,
         headerTitleAlign: 'center',

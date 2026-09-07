@@ -1,11 +1,11 @@
 import { useUser } from '@clerk/clerk-expo';
 import { useRouter } from 'expo-router';
 import { useEffect, useState } from 'react';
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
 
-import { colors } from '@/constants/colors';
 import { useMatchmaking } from '@/lib/matchmaking';
 import { useMatchPlayers } from '@/lib/matches';
+import { Button, Screen, colors, radii, spacing, type } from '@/ui';
 
 /** How long the "Opponent found" confirmation shows before the game begins. */
 const CONFIRMATION_MS = 3000;
@@ -41,68 +41,65 @@ export default function MatchmakingScreen() {
 
   if (state.status === 'matched') {
     return (
-      <View style={styles.center}>
+      <Screen style={styles.center}>
+        <View style={styles.avatar}>
+          <Text style={styles.avatarText}>
+            {opponent?.avatar || opponent?.username?.charAt(0).toUpperCase() || '?'}
+          </Text>
+        </View>
         <Text style={styles.foundLabel}>Opponent found</Text>
         <Text style={styles.foundName}>{opponent?.username ?? '…'}</Text>
         <ActivityIndicator color={colors.primary} style={styles.foundSpinner} />
         <Text style={styles.help}>Starting the game…</Text>
-      </View>
+      </Screen>
     );
   }
 
   if (state.status === 'error') {
     return (
-      <View style={styles.center}>
+      <Screen style={styles.center}>
         <Text style={styles.error}>{state.message}</Text>
-        <Pressable style={styles.cancelButton} onPress={() => router.back()}>
-          <Text style={styles.cancelButtonText}>Back</Text>
-        </Pressable>
-      </View>
+        <Button title="Back" variant="secondary" onPress={() => router.back()} style={styles.action} />
+      </Screen>
     );
   }
 
   return (
-    <View style={styles.center}>
+    <Screen style={styles.center}>
       <ActivityIndicator size="large" color={colors.primary} />
       <Text style={styles.searching}>Searching for opponent…</Text>
       <Text style={styles.help}>You’ll be paired with the player who has waited longest.</Text>
-      <Pressable
-        style={[styles.cancelButton, cancelling && styles.buttonDisabled]}
+      <Button
+        title="Cancel"
+        variant="secondary"
         onPress={onCancel}
-        disabled={cancelling}>
-        {cancelling ? (
-          <ActivityIndicator color={colors.primary} />
-        ) : (
-          <Text style={styles.cancelButtonText}>Cancel</Text>
-        )}
-      </Pressable>
-    </View>
+        busy={cancelling}
+        disabled={cancelling}
+        style={styles.action}
+      />
+    </Screen>
   );
 }
 
 const styles = StyleSheet.create({
-  center: {
-    flex: 1,
+  center: { alignItems: 'center', justifyContent: 'center' },
+  searching: { ...type.title, marginTop: spacing.xl },
+  help: { ...type.body, color: colors.inkMuted, marginTop: spacing.sm, textAlign: 'center' },
+  avatar: {
+    width: 72,
+    height: 72,
+    borderRadius: radii.pill,
+    backgroundColor: colors.accentSoft,
+    borderWidth: 1.5,
+    borderColor: colors.accent,
     alignItems: 'center',
     justifyContent: 'center',
-    padding: 24,
-    backgroundColor: colors.background,
+    marginBottom: spacing.md,
   },
-  searching: { fontSize: 18, fontWeight: '700', color: colors.text, marginTop: 20 },
-  help: { color: colors.textMuted, marginTop: 8, textAlign: 'center' },
-  foundLabel: { color: colors.textMuted, fontWeight: '600', fontSize: 16 },
-  foundName: { fontSize: 28, fontWeight: '800', color: colors.text, marginTop: 6 },
-  foundSpinner: { marginTop: 24 },
-  cancelButton: {
-    marginTop: 32,
-    borderWidth: 1.5,
-    borderColor: colors.primary,
-    borderRadius: 12,
-    paddingVertical: 14,
-    paddingHorizontal: 48,
-    alignItems: 'center',
-  },
-  cancelButtonText: { color: colors.primary, fontWeight: '700', fontSize: 16 },
-  buttonDisabled: { opacity: 0.6 },
-  error: { color: colors.wrong, textAlign: 'center' },
+  avatarText: { fontSize: 32, fontWeight: '900', color: colors.accentPressed },
+  foundLabel: { ...type.label, color: colors.inkMuted },
+  foundName: { ...type.display, marginTop: spacing.xs },
+  foundSpinner: { marginTop: spacing.xl },
+  action: { alignSelf: 'stretch', marginTop: spacing.xl },
+  error: { ...type.body, color: colors.danger, textAlign: 'center' },
 });

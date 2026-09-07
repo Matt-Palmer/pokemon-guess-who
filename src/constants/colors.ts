@@ -1,32 +1,10 @@
-import { colors as theme } from '@/ui/theme';
-
 /**
- * @deprecated Legacy palette names, re-pointed at the board-game theme
- * (`src/ui/theme.ts`) so unmigrated screens pick up the new look. Issues 13–16
- * move each screen onto the semantic tokens directly; delete this when the
- * last screen migrates. `typeColors` below is content, not chrome — it stays.
+ * The deprecated `colors` alias (legacy palette names re-pointed at the
+ * board-game theme) has been retired now that every chrome screen consumes
+ * `@/ui` directly — issue 16 migrated the last of them (the auth screens).
+ * Only `typeColors` remains here: it's game content, not chrome, and is
+ * permanently exempt from theming.
  */
-export const colors = {
-  primary: theme.primary,
-  primaryDark: theme.primaryPressed,
-  primaryBg: theme.primarySoft,
-  accent: theme.accent,
-  accentDark: theme.accentPressed,
-  accentBg: theme.accentSoft,
-  background: theme.background,
-  card: theme.surface,
-  text: theme.ink,
-  textMuted: theme.inkMuted,
-  border: theme.border,
-  correct: theme.success,
-  correctBg: theme.successSoft,
-  wrong: theme.danger,
-  wrongBg: theme.dangerSoft,
-  selected: theme.primary,
-  selectedBg: theme.primarySoft,
-  onPrimary: theme.onPrimary,
-  onAccent: theme.onAccent,
-} as const;
 
 /** Official Pokémon type colors — content, permanently exempt from theming. */
 export const typeColors: Record<string, string> = {

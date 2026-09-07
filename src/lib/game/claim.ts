@@ -5,8 +5,7 @@
  * so how long until — or that — they may claim the win. Time is an input
  * (`nowMs`), so the derivation is deterministic and the countdown is a pure
  * function of the match row the client already holds: the window runs from
- * `last_activity_at`, which every gameplay RPC bumps (the server-only
- * `claim_notified` flag never reaches clients and plays no part here).
+ * `last_activity_at`, which every gameplay RPC bumps.
  */
 
 import { CLAIM_WINDOW_MS } from './reducer';

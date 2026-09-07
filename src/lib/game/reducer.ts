@@ -204,8 +204,8 @@ function guess(state: MatchState, player: PlayerSlot, pokemonId: number): MatchS
  * Resign: an immediate forfeit, available to either player at any point in an
  * active match (draw phase included) and never turn-gated — you can always walk
  * away. The opponent wins and the match ends exactly like a correct guess
- * (`completed` + `winnerId` + `endedAt`), so downstream game-end effects (stats,
- * notifications) ride the same status edge. Only an explicit resign forfeits;
+ * (`completed` + `winnerId` + `endedAt`), so downstream game-end effects (stats)
+ * ride the same status edge. Only an explicit resign forfeits;
  * a disconnect or app-close leaves the match active and resumable.
  */
 function resign(state: MatchState, player: PlayerSlot): MatchState {
