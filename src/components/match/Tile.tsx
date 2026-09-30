@@ -174,21 +174,26 @@ export function Tile({
     pressed.value = withSpring(0, { damping: 20, stiffness: 400 });
   }, [pressed]);
 
+  // The deal-in lives on a wrapper: a layout animation and the press/shake
+  // transform can't share one view without the animation clobbering it.
   return (
-    <AnimatedPressable
+    <Animated.View
       entering={ZoomIn.springify().damping(16).delay(dealDelay(dealIndex))}
-      style={[styles.root, pieceStyle]}
-      disabled={disabled}
-      onPress={onPress}
-      onPressIn={onPressIn}
-      onPressOut={onPressOut}>
-      <FlipCard
-        flipped={faceDown}
-        style={styles.flip}
-        front={<TileFace card={card} view={view} mine={mine} targeted={targeted} dealIndex={dealIndex} />}
-        back={<CardBack />}
-      />
-    </AnimatedPressable>
+      style={styles.root}>
+      <AnimatedPressable
+        style={[styles.root, pieceStyle]}
+        disabled={disabled}
+        onPress={onPress}
+        onPressIn={onPressIn}
+        onPressOut={onPressOut}>
+        <FlipCard
+          flipped={faceDown}
+          style={styles.flip}
+          front={<TileFace card={card} view={view} mine={mine} targeted={targeted} dealIndex={dealIndex} />}
+          back={<CardBack />}
+        />
+      </AnimatedPressable>
+    </Animated.View>
   );
 }
 
