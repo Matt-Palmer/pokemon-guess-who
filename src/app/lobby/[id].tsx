@@ -98,6 +98,15 @@ export default function LobbyScreen() {
         )}
       </View>
 
+      {/* Say which game was created: the joiner never chose the mode, they
+          inherited it, so the lobby is where they find out. */}
+      {match.mode === 'local' && (
+        <Text style={styles.modeNote}>
+          Same-room game · no turns and no typing — ask your questions out loud and the app
+          keeps each of your boards.
+        </Text>
+      )}
+
       <View style={styles.spacer} />
 
       {isHost ? (
@@ -118,6 +127,13 @@ export default function LobbyScreen() {
 }
 
 const styles = StyleSheet.create({
+  modeNote: {
+    ...type.body,
+    color: colors.inkMuted,
+    textAlign: 'center',
+    marginTop: spacing.md,
+    paddingHorizontal: spacing.md,
+  },
   center: { alignItems: 'center', justifyContent: 'center' },
   codeCard: { alignItems: 'center', gap: spacing.sm },
   codeLabel: { ...type.label, color: colors.inkMuted },

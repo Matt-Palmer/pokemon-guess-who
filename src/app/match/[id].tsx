@@ -1,8 +1,7 @@
 import { useUser } from '@clerk/clerk-expo';
-import { Image } from 'expo-image';
-import { useLocalSearchParams } from 'expo-router';
+import { useLocalSearchParams, useRouter } from 'expo-router';
 import { ReactNode, useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import Animated, {
   FadeIn,
   FadeInDown,
@@ -16,8 +15,10 @@ import Animated, {
 } from 'react-native-reanimated';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { DrawCeremony } from '@/components/match/DrawCeremony';
+import { CardDetail } from '@/components/match/CardDetail';
+import { PokemonImage, prefetchSprites } from '@/components/match/PokemonImage';
 import { GuessReveal } from '@/components/match/GuessReveal';
+import { PickCeremony } from '@/components/match/PickCeremony';
 import { Tile, TileView } from '@/components/match/Tile';
 import { claimState, formatRemaining } from '@/lib/game/claim';
 import { guessedSecretId, shouldPlayGuessReveal } from '@/lib/game/reveal';
@@ -32,6 +33,7 @@ import {
   MatchStatus,
   PokemonCard,
   resign,
+  revealMySecret,
   useBoardMarks,
   useBoardPokemon,
   useMatch,
@@ -41,9 +43,25 @@ import {
   useMySecret,
 } from '@/lib/matches';
 import { useSupabase } from '@/lib/supabase';
-import { Badge, Button, CardModal, Screen, TextField, colors, radii, shadows, spacing, type } from '@/ui';
+import {
+  Badge,
+  Button,
+  CardModal,
+  ConfirmDialog,
+  Screen,
+  TextField,
+  colors,
+  radii,
+  shadows,
+  spacing,
+  type,
+  type Confirmation,
+} from '@/ui';
 
 const BOARD_COLUMNS = 4;
+
+/** The deliberate beat on "waiting for game to start" before play opens. */
+const PICK_HOLD_MS = 3000;
 
 /** Floating chat-bubble diameter. The board reserves this much clear space at
  *  the bottom so the bubble never sits on top of the last tile (ADR 0001: all
@@ -93,12 +111,23 @@ function ChatBubble({
   );
 }
 
-/** Slim always-visible phase + whose-move indicator; resign/review live here. */
+/**
+ * Slim always-visible phase + whose-move indicator; resign/review live here.
+ *
+ * It also carries your own secret during play (issue 4). Your secret sits on the
+ * shared board like any other card, so crossing it off — which you will, while
+ * eliminating candidates — used to flip it face-down and take its name, types
+ * and region with it, exactly when an opponent's question needs them. The chip
+ * is the one copy of your secret that can't be crossed off, and it opens the
+ * full detail card on tap.
+ */
 function TurnStrip({
   phaseLabel,
   myMove,
   text,
   hint,
+  secret,
+  onSecretPress,
   onReview,
   onResign,
   resignDisabled,
@@ -107,6 +136,8 @@ function TurnStrip({
   myMove: boolean;
   text: string;
   hint?: string;
+  secret?: PokemonCard | null;
+  onSecretPress?: () => void;
   onReview?: () => void;
   onResign?: () => void;
   resignDisabled?: boolean;
@@ -128,6 +159,19 @@ function TurnStrip({
           </Text>
         ) : null}
       </Animated.View>
+      {secret && (
+        <Pressable
+          hitSlop={8}
+          onPress={onSecretPress}
+          style={styles.stripSecret}
+          accessibilityRole="button"
+          accessibilityLabel={`Your secret is ${secret.name}. Tap for its details.`}>
+          <PokemonImage uri={secret.sprite_url} style={styles.stripSecretSprite} fallback={false} />
+          <Text style={styles.stripSecretName} numberOfLines={1}>
+            {secret.name}
+          </Text>
+        </Pressable>
+      )}
       {onReview && (
         <Pressable hitSlop={8} onPress={onReview}>
           <Text style={styles.stripReview}>Review</Text>
@@ -209,16 +253,23 @@ export default function MatchScreen() {
   const { user } = useUser();
   const supabase = useSupabase();
   const insets = useSafeAreaInsets();
+  const router = useRouter();
   const { match, loading, error, refetch } = useMatch(id);
   const cards = useBoardPokemon(match?.board);
   const { secret: mySecretId, refetch: refetchSecret } = useMySecret(id);
   const events = useMatchEvents(id, match?.last_activity_at);
   const { marks, toggle: toggleMark } = useBoardMarks(id);
+  const bothDrawn = Boolean(match?.player1_drawn && match?.player2_drawn);
   const players = useMatchPlayers(id);
   const result = useMatchResult(id, match?.status === 'completed');
   const [view, setView] = useState<TileView>('pokemon');
   const [drawing, setDrawing] = useState(false);
   const [drawError, setDrawError] = useState<string | null>(null);
+  /** The tile highlighted during the secret pick. Nothing is written until it
+   *  is confirmed, so browsing and changing your mind are free. */
+  const [selected, setSelected] = useState<PokemonCard | null>(null);
+  /** The card whose full details are open, from the pick bar or the secret chip. */
+  const [detailCard, setDetailCard] = useState<PokemonCard | null>(null);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
   const [turnError, setTurnError] = useState<string | null>(null);
@@ -229,11 +280,17 @@ export default function MatchScreen() {
   const [reviewOpen, setReviewOpen] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
   const [ending, setEnding] = useState(false);
+  /** The pending confirmation, if any. Replaces `Alert.alert`, which React
+   *  Native Web silently no-ops — every confirm-gated action was dead in a
+   *  browser because the dialog never opened. */
+  const [confirmation, setConfirmation] = useState<Confirmation | null>(null);
   const threadRef = useRef<ScrollView>(null);
   // Motion state (issue 14) — presentation over already-written game state.
   const [reveal, setReveal] = useState<{ outcome: 'win' | 'loss'; card: PokemonCard | null } | null>(null);
-  const [ceremony, setCeremony] = useState(false);
   const [shake, setShake] = useState<{ cardId: number; nonce: number } | null>(null);
+  /** Holds the pick ceremony on "waiting for game to start" for a deliberate
+   *  beat once both secrets are in, so play never opens as a jump-cut. */
+  const [startHold, setStartHold] = useState(false);
 
   // The guess reveal plays on the observed edge into a guess-completed match —
   // that's how the opponent (watching via Realtime) gets the same turn-over
@@ -249,6 +306,26 @@ export default function MatchScreen() {
       setReveal((current) => current ?? { outcome, card: null });
     }
   }, [match, user]);
+
+  // Both secrets just landed: hold the ceremony on "waiting for game to start"
+  // for a beat before play opens. Only a transition counts — returning to a
+  // match that is already under way must go straight to the board, which is why
+  // the first observed value seeds the ref instead of triggering the hold.
+  const bothDrawnRef = useRef<boolean | null>(null);
+  useEffect(() => {
+    const prev = bothDrawnRef.current;
+    bothDrawnRef.current = bothDrawn;
+    if (prev !== false || !bothDrawn) return;
+    setStartHold(true);
+    const t = setTimeout(() => setStartHold(false), PICK_HOLD_MS);
+    return () => clearTimeout(t);
+  }, [bothDrawn]);
+
+  // Warm the whole board's sprites as soon as the cards arrive, so 24 tiles
+  // don't each race the network as they deal in.
+  useEffect(() => {
+    prefetchSprites(cards.map((c) => c.sprite_url));
+  }, [cards]);
 
   // Coarse clock for the claim countdown: the window is 7 days, so a slow tick
   // keeps the "claim in Xd Yh" copy honest without re-rendering every second.
@@ -292,7 +369,6 @@ export default function MatchScreen() {
   const hasUnread = events.length > seenEvents && lastEvent?.author_id !== user?.id;
 
   const mySlot = match ? (match.player1_id === user?.id ? 'player1' : 'player2') : null;
-  const bothDrawn = Boolean(match?.player1_drawn && match?.player2_drawn);
   const myDrawn = mySlot === 'player1' ? match?.player1_drawn : match?.player2_drawn;
 
   const mySecretCard = useMemo(
@@ -323,16 +399,18 @@ export default function MatchScreen() {
   };
   const oppName = nameFor(oppSlot, 'your opponent');
 
-  const onDraw = async (card: PokemonCard) => {
-    if (!id || drawing) return;
+  /** Commit the highlighted tile as your secret. The only write in the pick
+   *  phase, and it is final — hence the explicit confirm behind it. */
+  const onConfirmPick = async () => {
+    if (!id || !selected || drawing) return;
     setDrawError(null);
     setDrawing(true);
     try {
-      await drawSecret(supabase, id, card.id);
+      await drawSecret(supabase, id, selected.id);
       await refetchSecret();
-      setCeremony(true);
+      await refetch();
     } catch (err: any) {
-      setDrawError(err?.message ?? 'Could not draw that card.');
+      setDrawError(err?.message ?? 'Could not lock in that card.');
     } finally {
       setDrawing(false);
     }
@@ -431,6 +509,7 @@ export default function MatchScreen() {
   // ── screen refetches on success so it never waits on Realtime.        ──
   const doResign = async () => {
     if (!id || ending) return;
+    setConfirmation(null);
     setTurnError(null);
     setEnding(true);
     try {
@@ -444,14 +523,44 @@ export default function MatchScreen() {
   };
 
   const onResign = () => {
-    Alert.alert('Resign this game?', `${oppName} wins and you take the loss.`, [
-      { text: 'Keep playing', style: 'cancel' },
-      { text: 'Resign', style: 'destructive', onPress: doResign },
-    ]);
+    setConfirmation({
+      title: 'Resign this game?',
+      message: `${oppName} wins and you take the loss.`,
+      confirmLabel: 'Resign',
+      cancelLabel: 'Keep playing',
+      danger: true,
+      onConfirm: doResign,
+    });
+  };
+
+  const doReveal = async () => {
+    if (!id || ending) return;
+    setConfirmation(null);
+    setTurnError(null);
+    setEnding(true);
+    try {
+      await revealMySecret(supabase, id);
+      await refetch();
+    } catch (err: any) {
+      setTurnError(err?.message ?? 'Could not reveal your secret.');
+    } finally {
+      setEnding(false);
+    }
+  };
+
+  const onReveal = () => {
+    setConfirmation({
+      title: 'Reveal your secret?',
+      message: `${oppName} will see your card and the game ends. Do this once they have guessed it.`,
+      confirmLabel: 'Reveal',
+      cancelLabel: 'Not yet',
+      onConfirm: doReveal,
+    });
   };
 
   const doClaim = async () => {
     if (!id || ending) return;
+    setConfirmation(null);
     setTurnError(null);
     setEnding(true);
     try {
@@ -465,10 +574,13 @@ export default function MatchScreen() {
   };
 
   const onClaim = () => {
-    Alert.alert('Claim the win?', `${oppName} hasn't moved in 7 days. Claiming ends the game as your win.`, [
-      { text: 'Not yet', style: 'cancel' },
-      { text: 'Claim the win', onPress: doClaim },
-    ]);
+    setConfirmation({
+      title: 'Claim the win?',
+      message: `${oppName} hasn't moved in 7 days. Claiming ends the game as your win.`,
+      confirmLabel: 'Claim the win',
+      cancelLabel: 'Not yet',
+      onConfirm: doClaim,
+    });
   };
 
   // Countdown/claim availability while waiting on the opponent. Derived from
@@ -509,51 +621,102 @@ export default function MatchScreen() {
       onDone={() => setReveal(null)}
     />
   ) : null;
-  const ceremonyUi =
-    ceremony && mySecretCard ? (
-      <DrawCeremony card={mySecretCard} onDone={() => setCeremony(false)} />
-    ) : null;
+  const confirmUi = (
+    <ConfirmDialog confirmation={confirmation} busy={ending} onCancel={() => setConfirmation(null)} />
+  );
 
-  // ── Blind-draw phase: tiles face-down until both players have drawn. ──
-  if (!bothDrawn) {
-    const stripText =
-      turn.kind === 'your_draw'
-        ? 'Your draw'
-        : myDrawn
-          ? `Waiting for ${oppName}…`
-          : `Waiting for ${nameFor('player1', 'player 1')}…`;
+  /* Review: own cross-offs + the paired Q/A history. Reachable during play
+     from the turn strip, and again from the outcome screen — the end of a
+     match is the natural moment to look back at how it went. */
+  const reviewUi = (
+          <CardModal visible={reviewOpen} onClose={() => setReviewOpen(false)} title="Review">
+        <Text style={styles.reviewSummary}>
+          {review.crossedOff.length} crossed off · {review.remaining.length} remaining
+        </Text>
+        <ScrollView style={styles.reviewScroll} contentContainerStyle={styles.reviewContent}>
+          <Text style={styles.reviewSection}>Your crossed-off tiles</Text>
+          {review.crossedOff.length === 0 ? (
+            <Text style={styles.reviewEmpty}>Nothing crossed off yet.</Text>
+          ) : (
+            <View style={styles.reviewGrid}>
+              {review.crossedOff.map((card) => (
+                <View key={card.id} style={styles.reviewCard}>
+                  <PokemonImage uri={card.sprite_url} style={styles.reviewSprite} />
+                  <Text style={styles.reviewCardName} numberOfLines={1}>
+                    {card.name}
+                  </Text>
+                </View>
+              ))}
+            </View>
+          )}
+
+          <Text style={styles.reviewSection}>Questions & answers</Text>
+          {qaHistory.length === 0 ? (
+            <Text style={styles.reviewEmpty}>No questions asked yet.</Text>
+          ) : (
+            qaHistory.map(({ question, answer }) => (
+              <View key={question.id} style={styles.reviewQa}>
+                <Text style={styles.reviewQaMeta}>
+                  {question.author_id === user?.id
+                    ? 'You asked'
+                    : `${nameFor(question.author_slot, 'Opponent')} asked`}
+                </Text>
+                <Text style={styles.reviewQuestion}>{question.body}</Text>
+                <Text style={styles.reviewAnswer}>
+                  {answer ? answer.body : 'Awaiting answer…'}
+                </Text>
+              </View>
+            ))
+          )}
+        </ScrollView>
+      </CardModal>
+  );
+
+  // ── Secret pick: the board is face-up and both players choose at once. ──
+  if (!bothDrawn || startHold) {
+    // Locked in. The board falls away and your card takes the screen; this is
+    // also the waiting state, so there is no separate spinner screen.
+    if (myDrawn) {
+      return (
+        <Screen padded={false} style={{ paddingBottom: insets.bottom }}>
+          {mySecretCard ? (
+            <PickCeremony
+              card={mySecretCard}
+              wait={bothDrawn ? 'start' : 'opponent'}
+              oppName={oppName}
+            />
+          ) : (
+            <View style={styles.center}>
+              <ActivityIndicator color={colors.primary} />
+            </View>
+          )}
+        </Screen>
+      );
+    }
 
     return (
       <Screen padded={false} style={{ paddingBottom: insets.bottom }}>
-        <TurnStrip
-          phaseLabel="Blind draw"
-          myMove={turn.kind === 'your_draw'}
-          text={stripText}
-          hint={turn.kind === 'your_draw' ? 'Tap a face-down tile to draw' : 'Each player draws a secret'}
-          onResign={onResign}
-          resignDisabled={ending}
-        />
+        {/* Deliberately NOT the match screen's furniture. The pick used to
+            reuse the turn strip and the view toggle, so it was visually
+            identical to the board mid-game — players arrived here and assumed
+            the game had started without them, or had broken. A setup screen
+            should announce itself. */}
+        <View style={styles.pickHeader}>
+          <Text style={styles.pickTitle}>Choose your secret</Text>
+          <Text style={styles.pickSubtitle}>
+            Pick the Pokémon {oppName} will try to guess. They&apos;re choosing at the same
+            time — you won&apos;t see each other&apos;s.
+          </Text>
+          {onResign && (
+            <Pressable hitSlop={8} disabled={ending} onPress={onResign} style={styles.pickQuit}>
+              <Text style={styles.pickQuitText}>Quit game</Text>
+            </Pressable>
+          )}
+        </View>
+
         {drawError && <Text style={styles.error}>{drawError}</Text>}
         {turnError && <Text style={styles.error}>{turnError}</Text>}
         {claimUi}
-
-        {myDrawn && (
-          <View style={styles.secretBanner}>
-            <Text style={styles.secretLabel}>Your secret</Text>
-            {mySecretCard ? (
-              <View style={styles.secretCardRow}>
-                <Image
-                  source={{ uri: mySecretCard.sprite_url }}
-                  style={styles.secretSprite}
-                  contentFit="contain"
-                />
-                <Text style={styles.secretName}>{mySecretCard.name}</Text>
-              </View>
-            ) : (
-              <ActivityIndicator color={colors.primary} />
-            )}
-          </View>
-        )}
 
         <BoardGrid
           cards={cards}
@@ -561,16 +724,39 @@ export default function MatchScreen() {
             <Tile
               key={card.id}
               card={card}
-              faceDown
+              faceDown={false}
               dealIndex={index}
-              backMark={card.id === mySecretId ? '★' : undefined}
-              disabled={turn.kind !== 'your_draw' || drawing}
-              onPress={() => onDraw(card)}
+              targeted={selected?.id === card.id}
+              disabled={drawing}
+              onPress={() => setSelected(card)}
             />
           )}
         />
 
-        {ceremonyUi}
+        {/* Nothing reaches the server until you lock in, so browsing and
+            changing your mind are free — and the commit, which is final, is a
+            deliberate act rather than a stray tap on a small tile. */}
+        <View style={styles.pickBar}>
+          <Button
+            title="Details"
+            variant="secondary"
+            disabled={!selected}
+            onPress={() => setDetailCard(selected)}
+            style={styles.pickDetails}
+          />
+          <Button
+            title={selected ? `Lock in ${displayName(selected.name)}` : 'Pick a tile'}
+            disabled={!selected}
+            busy={drawing}
+            onPress={onConfirmPick}
+            style={styles.pickConfirm}
+          />
+        </View>
+
+        <CardModal visible={Boolean(detailCard)} onClose={() => setDetailCard(null)}>
+          {detailCard && <CardDetail card={detailCard} />}
+        </CardModal>
+        {confirmUi}
       </Screen>
     );
   }
@@ -583,6 +769,9 @@ export default function MatchScreen() {
       return <Screen padded={false}>{revealUi}</Screen>;
     }
 
+    // A local match ends with no winner: the app never saw a guess, so it has
+    // nothing to record and neither player is told they lost.
+    const noWinner = !match.winner_id;
     const didIWin = match.winner_id === user?.id;
     const oppSecretId = oppSlot === 'player1' ? result?.player1Secret : result?.player2Secret;
     const mySecretReveal = mySlot === 'player1' ? result?.player1Secret : result?.player2Secret;
@@ -594,11 +783,11 @@ export default function MatchScreen() {
         <Text style={styles.revealLabel}>{label}</Text>
         {card ? (
           <>
-            <Image source={{ uri: card.sprite_url }} style={styles.revealSprite} contentFit="contain" />
+            <PokemonImage uri={card.sprite_url} style={styles.revealSprite} />
             <Text style={styles.revealName}>{card.name}</Text>
           </>
         ) : result ? (
-          // A resign during the blind draw can end a game before a secret exists.
+          // A resign during the secret pick can end a game before a secret exists.
           <Text style={styles.revealName}>Never drawn</Text>
         ) : (
           <ActivityIndicator color={colors.primary} />
@@ -608,7 +797,11 @@ export default function MatchScreen() {
 
     // How the game ended shapes the outcome copy — a forfeit or an inactivity
     // claim must not read as a guessed secret.
-    const endSubtitle = didIWin
+    const endSubtitle = noWinner
+      ? match.ended_reason === 'revealed'
+        ? 'Secrets revealed.'
+        : 'This game ended without a winner.'
+      : didIWin
       ? match.ended_reason === 'resign'
         ? `${oppName} resigned.`
         : match.ended_reason === 'claim_inactive'
@@ -624,8 +817,8 @@ export default function MatchScreen() {
       <Screen style={styles.endPanel}>
         <Animated.Text
           entering={ZoomIn.springify().damping(14)}
-          style={[styles.endTitle, didIWin ? styles.endWin : styles.endLose]}>
-          {didIWin ? 'You won! 🎉' : 'You lost'}
+          style={[styles.endTitle, noWinner ? undefined : didIWin ? styles.endWin : styles.endLose]}>
+          {noWinner ? 'Game over' : didIWin ? 'You won! 🎉' : 'You lost'}
         </Animated.Text>
         <Animated.Text entering={FadeIn.delay(200).duration(300)} style={styles.endSubtitle}>
           {endSubtitle}
@@ -634,6 +827,77 @@ export default function MatchScreen() {
           <RevealCard label={`${oppName}'s secret`} card={oppSecretCard} />
           <RevealCard label="Your secret" card={mySecretRevealCard} />
         </Animated.View>
+
+        {/* A screen that ends a game needs a deliberate way off it. The header
+            back button covers the reflex; this covers everyone else. */}
+        <Animated.View entering={FadeInDown.delay(500).duration(300)} style={styles.endActions}>
+          {/* Nothing to review in a local game — the questions were spoken,
+              never written, so the panel would open on an empty thread. */}
+          {match.mode !== 'local' && (
+            <Button
+              title="Review the questions"
+              variant="secondary"
+              onPress={() => setReviewOpen(true)}
+            />
+          )}
+          <Button title="Back to Games" onPress={() => router.replace('/(tabs)')} />
+        </Animated.View>
+
+        {match.mode !== 'local' && reviewUi}
+      </Screen>
+    );
+  }
+
+  // ── Local play: a digital version of the physical board. No turns, no ──
+  // ── thread, no in-app guessing — the game is happening in the room and ──
+  // ── the app only holds each player's board. It ends when someone turns ──
+  // ── their own card over to confirm a spoken guess.                     ──
+  if (match.mode === 'local') {
+    return (
+      <Screen padded={false} style={{ paddingBottom: insets.bottom }}>
+        <TurnStrip
+          phaseLabel="Same room"
+          myMove={false}
+          text="Your board"
+          hint="Ask out loud · cross off tiles"
+          secret={mySecretCard}
+          onSecretPress={() => setDetailCard(mySecretCard)}
+        />
+
+        {turnError && <Text style={styles.error}>{turnError}</Text>}
+
+        <ViewToggle value={view} onChange={setView} />
+
+        <BoardGrid
+          cards={cards}
+          renderTile={(card, index) => (
+            <Tile
+              key={card.id}
+              card={card}
+              faceDown={marks.has(card.id)}
+              dealIndex={index}
+              mine={card.id === mySecretId}
+              view={view}
+              onPress={() => onToggleCross(card)}
+            />
+          )}
+        />
+
+        {/* The only way a same-room game ends. You reveal your *own* card —
+            never your opponent's — so there is no way to peek. */}
+        <View style={styles.revealBar}>
+          <Button
+            title="Reveal my secret"
+            variant="secondary"
+            busy={ending}
+            onPress={onReveal}
+          />
+        </View>
+
+        <CardModal visible={Boolean(detailCard)} onClose={() => setDetailCard(null)}>
+          {detailCard && <CardDetail card={detailCard} />}
+        </CardModal>
+        {confirmUi}
       </Screen>
     );
   }
@@ -666,6 +930,8 @@ export default function MatchScreen() {
         myMove={Boolean(turn.myMove) || guessMode}
         text={stripText}
         hint={stripHint}
+        secret={mySecretCard}
+        onSecretPress={() => setDetailCard(mySecretCard)}
         onReview={() => setReviewOpen(true)}
         onResign={onResign}
         resignDisabled={ending}
@@ -738,6 +1004,11 @@ export default function MatchScreen() {
           onPress={() => setChatOpen(true)}
         />
       )}
+
+      {/* Card details, opened from the secret chip on the strip. */}
+      <CardModal visible={Boolean(detailCard)} onClose={() => setDetailCard(null)}>
+        {detailCard && <CardDetail card={detailCard} />}
+      </CardModal>
 
       {/* Chat modal: the thread + composition, over the dimmed board. The
           draft lives in screen state, so dismissing to peek at the board and
@@ -827,56 +1098,13 @@ export default function MatchScreen() {
         )}
       </CardModal>
 
-      {/* Review: own cross-offs + the paired Q/A history. */}
-      <CardModal visible={reviewOpen} onClose={() => setReviewOpen(false)} title="Review">
-        <Text style={styles.reviewSummary}>
-          {review.crossedOff.length} crossed off · {review.remaining.length} remaining
-        </Text>
-        <ScrollView style={styles.reviewScroll} contentContainerStyle={styles.reviewContent}>
-          <Text style={styles.reviewSection}>Your crossed-off tiles</Text>
-          {review.crossedOff.length === 0 ? (
-            <Text style={styles.reviewEmpty}>Nothing crossed off yet.</Text>
-          ) : (
-            <View style={styles.reviewGrid}>
-              {review.crossedOff.map((card) => (
-                <View key={card.id} style={styles.reviewCard}>
-                  <Image
-                    source={{ uri: card.sprite_url }}
-                    style={styles.reviewSprite}
-                    contentFit="contain"
-                  />
-                  <Text style={styles.reviewCardName} numberOfLines={1}>
-                    {card.name}
-                  </Text>
-                </View>
-              ))}
-            </View>
-          )}
 
-          <Text style={styles.reviewSection}>Questions & answers</Text>
-          {qaHistory.length === 0 ? (
-            <Text style={styles.reviewEmpty}>No questions asked yet.</Text>
-          ) : (
-            qaHistory.map(({ question, answer }) => (
-              <View key={question.id} style={styles.reviewQa}>
-                <Text style={styles.reviewQaMeta}>
-                  {question.author_id === user?.id
-                    ? 'You asked'
-                    : `${nameFor(question.author_slot, 'Opponent')} asked`}
-                </Text>
-                <Text style={styles.reviewQuestion}>{question.body}</Text>
-                <Text style={styles.reviewAnswer}>
-                  {answer ? answer.body : 'Awaiting answer…'}
-                </Text>
-              </View>
-            ))
-          )}
-        </ScrollView>
-      </CardModal>
+      {reviewUi}
+      {confirmUi}
 
-      {/* A second drawer's ceremony rides the draw → active switch; the
-          guesser's reveal starts here, before the completed row lands. */}
-      {ceremonyUi}
+      {/* The guesser's reveal starts here, before the completed row lands.
+          (The second picker's ceremony no longer needs to ride this switch —
+          `startHold` keeps them in the pick branch until play opens.) */}
       {revealUi}
     </Screen>
   );
@@ -900,6 +1128,26 @@ const styles = StyleSheet.create({
   stripBody: { flex: 1 },
   stripText: { ...type.label, fontSize: 14 },
   stripHint: { ...type.caption, fontSize: 11 },
+  stripSecret: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+    maxWidth: 110,
+    paddingVertical: 2,
+    paddingHorizontal: spacing.xs,
+    backgroundColor: colors.accentSoft,
+    borderRadius: radii.pill,
+    borderWidth: 1.5,
+    borderColor: colors.accent,
+  },
+  stripSecretSprite: { width: 24, height: 24 },
+  stripSecretName: {
+    color: colors.accentPressed,
+    fontWeight: '800',
+    fontSize: 11,
+    textTransform: 'capitalize',
+    flexShrink: 1,
+  },
   stripReview: { color: colors.primary, fontWeight: '800', fontSize: 13 },
   stripResign: { color: colors.danger, fontWeight: '800', fontSize: 13 },
 
@@ -910,20 +1158,30 @@ const styles = StyleSheet.create({
   boardLoading: { flex: 1, alignItems: 'center', justifyContent: 'center' },
 
   // Draw phase
-  secretBanner: {
-    marginHorizontal: spacing.md,
-    marginTop: spacing.sm,
-    padding: spacing.sm,
+  revealBar: { paddingHorizontal: spacing.sm, paddingBottom: spacing.sm },
+
+  // Secret pick — its own look, so it never reads as the game board.
+  pickHeader: {
     backgroundColor: colors.accentSoft,
-    borderRadius: radii.md,
-    borderWidth: 1.5,
-    borderColor: colors.accent,
-    alignItems: 'center',
+    borderBottomWidth: 2,
+    borderBottomColor: colors.accent,
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.md,
+    paddingBottom: spacing.md,
+    gap: spacing.xs,
   },
-  secretLabel: { color: colors.accentPressed, fontWeight: '700', fontSize: 12 },
-  secretCardRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
-  secretSprite: { width: 44, height: 44 },
-  secretName: { ...type.heading, textTransform: 'capitalize' },
+  pickTitle: { ...type.title, color: colors.accentPressed },
+  pickSubtitle: { ...type.caption, lineHeight: 17 },
+  pickQuit: { alignSelf: 'flex-start', marginTop: spacing.xs },
+  pickQuitText: { color: colors.danger, fontWeight: '800', fontSize: 12 },
+  pickBar: {
+    flexDirection: 'row',
+    gap: spacing.sm,
+    paddingHorizontal: spacing.sm,
+    paddingBottom: spacing.sm,
+  },
+  pickDetails: { flex: 1 },
+  pickConfirm: { flex: 2 },
 
   // Chat bubble
   bubble: {
@@ -1068,6 +1326,7 @@ const styles = StyleSheet.create({
   endTitle: { fontSize: 32, fontWeight: '900', marginBottom: spacing.sm },
   endWin: { color: colors.success },
   endLose: { color: colors.danger },
+  endActions: { alignSelf: 'stretch', gap: spacing.sm, marginTop: spacing.xl },
   endSubtitle: { ...type.body, color: colors.inkMuted, textAlign: 'center', marginBottom: spacing.xl },
   revealRow: { flexDirection: 'row', gap: spacing.lg },
   revealCol: {

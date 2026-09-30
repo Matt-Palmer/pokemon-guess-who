@@ -26,60 +26,68 @@ function activeMatch(overrides: Partial<MatchState> = {}): MatchState {
   };
 }
 
-describe('DRAW_SECRET — blind draw', () => {
-  test('player 1 draws first and their card becomes their secret', () => {
+describe('DRAW_SECRET — secret pick', () => {
+  test('a pick becomes that player’s secret', () => {
     const next = reduce(activeMatch(), { type: 'DRAW_SECRET', player: 'player1', pokemonId: 7 });
     expect(next.player1Secret).toBe(7);
     expect(next.player2Secret).toBeNull();
   });
 
-  test('player 2 draws from the remaining pool once player 1 has drawn', () => {
-    const afterP1 = reduce(activeMatch(), { type: 'DRAW_SECRET', player: 'player1', pokemonId: 7 });
-    const afterP2 = reduce(afterP1, { type: 'DRAW_SECRET', player: 'player2', pokemonId: 12 });
-    expect(afterP2.player1Secret).toBe(7);
+  test('either player may pick first — player 2 does not wait on player 1', () => {
+    const afterP2 = reduce(activeMatch(), { type: 'DRAW_SECRET', player: 'player2', pokemonId: 12 });
     expect(afterP2.player2Secret).toBe(12);
+    expect(afterP2.player1Secret).toBeNull();
+
+    const both = reduce(afterP2, { type: 'DRAW_SECRET', player: 'player1', pokemonId: 7 });
+    expect(both.player1Secret).toBe(7);
+    expect(both.player2Secret).toBe(12);
   });
 
-  test('the two secrets are always distinct — player 2 cannot draw player 1’s card', () => {
+  test('both players may pick the same Pokémon', () => {
     const afterP1 = reduce(activeMatch(), { type: 'DRAW_SECRET', player: 'player1', pokemonId: 7 });
-    expect(() => reduce(afterP1, { type: 'DRAW_SECRET', player: 'player2', pokemonId: 7 })).toThrow(
-      /already been drawn/i,
-    );
+    const afterP2 = reduce(afterP1, { type: 'DRAW_SECRET', player: 'player2', pokemonId: 7 });
+    expect(afterP2.player1Secret).toBe(7);
+    expect(afterP2.player2Secret).toBe(7);
   });
 
-  test('player 2 cannot draw before player 1 (turn order)', () => {
-    expect(() => reduce(activeMatch(), { type: 'DRAW_SECRET', player: 'player2', pokemonId: 12 })).toThrow(
-      /player 1/i,
-    );
+  test('guessing a shared card still resolves against the opponent’s secret', () => {
+    // Duplicates must not make a guess ambiguous: holding Snorlax yourself
+    // neither blocks nor gifts you the win when your opponent holds it too.
+    const shared = activeMatch({
+      player1Secret: 7,
+      player2Secret: 7,
+      currentPlayer: 'player1',
+      phase: 'awaiting_question',
+    });
+    const won = reduce(shared, { type: 'GUESS', player: 'player1', pokemonId: 7 });
+    expect(won.status).toBe('completed');
+    expect(won.winnerId).toBe(shared.player1Id);
   });
 
-  test('a player cannot draw a second secret', () => {
+  test('a player cannot pick a second secret', () => {
     const afterP1 = reduce(activeMatch(), { type: 'DRAW_SECRET', player: 'player1', pokemonId: 7 });
     expect(() => reduce(afterP1, { type: 'DRAW_SECRET', player: 'player1', pokemonId: 9 })).toThrow(
       /already drawn/i,
     );
   });
 
-  test('a card must be on the board to be drawn', () => {
+  test('a card must be on the board to be picked', () => {
     expect(() => reduce(activeMatch(), { type: 'DRAW_SECRET', player: 'player1', pokemonId: 999 })).toThrow(
       /not on the board/i,
     );
   });
 
-  test('after both draws the board is face-up and the match is ready for active play', () => {
+  test('after both picks every board card remains in play', () => {
     const afterP1 = reduce(activeMatch(), { type: 'DRAW_SECRET', player: 'player1', pokemonId: 7 });
     const afterP2 = reduce(afterP1, { type: 'DRAW_SECRET', player: 'player2', pokemonId: 12 });
 
-    // Both secrets assigned and distinct — the derived "face-up / drawing complete" state.
     expect(afterP2.player1Secret).not.toBeNull();
     expect(afterP2.player2Secret).not.toBeNull();
-    expect(afterP2.player1Secret).not.toBe(afterP2.player2Secret);
-    // All 24 board cards remain in play for guessing (a secret leaves the draw
-    // pool, not the board).
+    // A secret is only removed from the *pick*, never from the board.
     expect(afterP2.board).toHaveLength(24);
   });
 
-  test('secrets can only be drawn during an active match', () => {
+  test('secrets can only be picked during an active match', () => {
     expect(() =>
       reduce(activeMatch({ status: 'lobby' }), { type: 'DRAW_SECRET', player: 'player1', pokemonId: 7 }),
     ).toThrow(/active/i);
@@ -347,7 +355,7 @@ describe('RESIGN — immediate forfeit', () => {
     expect(next.winnerId).toBe('user_1');
   });
 
-  test('a match can be resigned during the blind draw', () => {
+  test('a match can be resigned during the secret pick', () => {
     const next = reduce(activeMatch(), { type: 'RESIGN', player: 'player1' });
     expect(next.status).toBe('completed');
     expect(next.winnerId).toBe('user_2');
@@ -412,11 +420,29 @@ describe('CLAIM_INACTIVE — 7-day inactivity claim', () => {
     ).toThrow(/waiting on your opponent/i);
   });
 
-  test('a never-drawn opponent can be claimed against during the blind draw', () => {
+  test('an opponent who never picks can be claimed against during the secret pick', () => {
     // player1 drew; player2 never has. player1 waits out the window and claims.
     const state = activeMatch({ player1Secret: 7, lastActivityAt: stalledAt });
     const next = reduce(state, { type: 'CLAIM_INACTIVE', player: 'player1', now: after(7) });
     expect(next.winnerId).toBe('user_1');
+  });
+
+  test('when neither player has picked, either may claim against the other', () => {
+    // Picks are simultaneous, so both players can owe a move at once. Neither
+    // should be privileged by slot: after a week of mutual silence the claim is
+    // open to whoever asks for it first.
+    const state = activeMatch({ lastActivityAt: stalledAt });
+    expect(reduce(state, { type: 'CLAIM_INACTIVE', player: 'player1', now: after(7) }).winnerId).toBe('user_1');
+    expect(reduce(state, { type: 'CLAIM_INACTIVE', player: 'player2', now: after(7) }).winnerId).toBe('user_2');
+  });
+
+  test('a player who has picked cannot be claimed against while their opponent has not', () => {
+    // player2 picked, player1 did not: only player2 is owed a move, so player1
+    // — the one stalling — gets nothing.
+    const state = activeMatch({ player2Secret: 12, lastActivityAt: stalledAt });
+    expect(() =>
+      reduce(state, { type: 'CLAIM_INACTIVE', player: 'player1', now: after(7) }),
+    ).toThrow(/waiting on your opponent/i);
   });
 
   test('only an active match can be claimed', () => {

@@ -1,5 +1,12 @@
 # 03 — Blind draw
 
+> **Superseded.** The blind draw was replaced by the open, simultaneous
+> **secret pick**: the board is face-up from the start, both players choose at
+> once, and the two secrets may be the same. The turn order, the distinctness
+> rule, and the board reshuffle that guarded them are all gone. See
+> `supabase/migrations/00016_open_simultaneous_pick.sql` and the **Secret pick**
+> entry in [CONTEXT.md](../CONTEXT.md). Kept as the record of what shipped first.
+
 _Ready for agent. Source: [PRD.md](../PRD.md)._
 
 ## What to build

@@ -1,4 +1,3 @@
-import { Image } from 'expo-image';
 import { useEffect, useRef, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import Animated, {
@@ -12,6 +11,7 @@ import Animated, {
   withTiming,
 } from 'react-native-reanimated';
 
+import { PokemonImage } from '@/components/match/PokemonImage';
 import { PokemonCard } from '@/lib/matches';
 import { CardBack, colors, Confetti, FlipCard, motion, radii, shadows, spacing, type } from '@/ui';
 
@@ -107,11 +107,7 @@ export function GuessReveal({ outcome, card, oppName, onDone }: Props) {
               <View style={styles.cardFace}>
                 {card && (
                   <>
-                    <Image
-                      source={{ uri: card.sprite_url }}
-                      style={styles.sprite}
-                      contentFit="contain"
-                    />
+                    <PokemonImage uri={card.sprite_url} style={styles.sprite} />
                     <Text style={styles.cardName}>{card.name}</Text>
                   </>
                 )}

@@ -1,0 +1,8 @@
+- I don't want the pokemon hidden from the start. I want the user to be able to see which pokemon they are selecting.
+- Currently it takes it in turns for the players to choose their pokemon, I don't want any player to have to wait.
+- with the above, both players have the option to select the same pokemon.
+- on the gameboard, we need to keep the players selected pokemon visible as a seperate element on the screen. If a user turns over their own pokemon after one of their questions, then they can not see any information about their own pokemon when answering questions.
+- Sometimes when a player 1 turns over a card, that action is replicated on player 2's game board. Any action performed by a player, should not be repicated on another.
+- on some occasions the images of pokemon will go missing.
+- the back button in the header on mobiles is missing.
+- I need to be able to create a different game mode for when users are in the same room. I feel if they are in the same room then they should be given the option to be able to play without typing the questions. They still though need the option to guess the pokemon. 

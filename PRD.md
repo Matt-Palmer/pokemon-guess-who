@@ -56,11 +56,19 @@ it's their move. Each completed game updates the player's personal stats.
 21. As a player, I want a brief "opponent found: [username]" confirmation before the game starts, so that the transition isn't jarring.
 22. As a player, I want to never be paired with two opponents at once, so that matchmaking is reliable.
 
-### Board Setup & Blind Draw
+### Starting a Game — Same Room (local)
+
+52a. As a player sitting with a friend, I want a game mode that doesn't make me type my questions, so that we can just talk to each other.
+52b. As a local player, I want my own board and my own cross-offs on my own phone, so that it plays like two physical boards rather than one shared screen.
+52c. As a local player, I want to reveal my own card when my friend guesses it correctly, so that the game has a definite end.
+52d. As a local player, I want *only* my own card revealable by me, so that neither of us can peek at the other's.
+
+### Board Setup & Secret Pick
 23. As a player, I want a shared board of 24 Pokémon drawn from all 1025, so that every game feels fresh.
 24. As a player, I want the board generated on the server so both of us see the identical 24 cards, so that the game is fair.
-25. As a player, I want the cards laid out face-down at the start, so that the secret assignment feels like a genuine draw.
-26. As a player, I want to blindly select a face-down card as my secret, so that neither of us can cherry-pick an unfairly hard Pokémon.
+25. As a player, I want the cards laid out face-up at the start, so that I can see what I am choosing between.
+26. As a player, I want to choose my own secret from the board and confirm it before it is committed, so that a stray tap never decides my match for me.
+26a. As a player, I want to choose at the same time as my opponent, so that neither of us waits on the other to start.
 27. As a player, I want my drawn secret revealed only to me, so that my opponent doesn't know what they're guessing.
 28. As a player, I want my drawn card removed so my opponent can't draw the same one, so that our secrets are always different.
 29. As a player, I want all 24 cards to flip face-up when the game begins, so that I can start deducing my opponent's secret.
@@ -143,9 +151,9 @@ The entire match is modelled as a pure function `(matchState, event) => matchSta
 - Win/loss determination.
 - Streak/stat deltas.
 
-### Board & Blind Draw
+### Board & Secret Pick
 - Board = **24 Pokémon** drawn randomly from the seeded reference set, **generated server-side** so both players see the identical board.
-- Cards start **face-down**; player 1 blindly selects a card (their secret, revealed only to them), which is **removed** from the pool; player 2 then selects from the remaining 23.
+- Cards start **face-up**; both players choose a secret **simultaneously** from all 24, confirming the selection before it commits. Picks are private to their owner, and **both players may choose the same Pokémon** — a guess always resolves against the *opponent's* secret, so duplicates are harmless.
 - On game start, **all 24 cards flip face-up** for both players.
 - Secrets are drawn from the shared board (not freely chosen from all 1025).
 
@@ -158,9 +166,18 @@ The entire match is modelled as a pure function `(matchState, event) => matchSta
 - Who takes the **first turn** is decided by a random coin flip at game start.
 - Wrong guesses (and what was guessed) are fully private to the guesser.
 
+### Same-Room (local) Mode
+
+- A third `mode`, `local`, alongside `party` and `random`. Created from the same party modal ("Play in the same room"), with the same code, lobby and start flow — the joiner inherits the mode and never chooses it.
+- **Two devices, one each.** Not pass-and-play: each player keeps their own private board, their own cross-offs and their own secret, exactly as online. Only the conversation moves off the app.
+- **No turn loop.** Once both players have picked, `phase` and `current_player` stay null and no coin flip happens. No `match_events` thread, no chat, no in-app guessing, and therefore no wrong-guess review panel.
+- **Ending:** `reveal_my_secret` — a player discloses **their own** secret, which is how you confirm a correct spoken guess. Owner-triggered by design: a button that revealed the *opponent's* card would be a peek button and would make the mode trivially cheatable.
+- **No winner, no stats.** The app never saw a guess, so `winner_id` stays null and `ended_reason` is `revealed`. The existing game-end trigger already skips winnerless completions, so profile records are untouched by construction.
+- **No inactivity claim** during local play — there is no stalled mover to accuse. It still applies during the secret pick, where someone can leave you waiting.
+
 ### Entry Paths
 - **Private party:** host creates a party and receives a **6-character alphanumeric code** excluding ambiguous characters (0/O, 1/I/L), unique among currently-active parties (recycled after a game ends). Host waits in a lobby, sees the joiner, and presses **Start**. Joining with an invalid/full/in-progress code shows a clear error.
-- **Random matchmaking:** first-come-first-served. A `matchmaking_queue` table plus an **atomic Postgres RPC** pairs the enqueuing player with the oldest waiting opponent, using row locking to prevent two players grabbing the same opponent (concurrency correctness is the point). "Searching…" screen with Cancel (removes from queue). On pairing, a brief 3-second "Opponent found: [username]" confirmation precedes the blind draw.
+- **Random matchmaking:** first-come-first-served. A `matchmaking_queue` table plus an **atomic Postgres RPC** pairs the enqueuing player with the oldest waiting opponent, using row locking to prevent two players grabbing the same opponent (concurrency correctness is the point). "Searching…" screen with Cancel (removes from queue). On pairing, a brief 3-second "Opponent found: [username]" confirmation precedes the secret pick.
 
 ### Async Lifecycle & Abandonment
 - Games are **async and long-lived**; closing the app is normal and never forfeits. State in Postgres makes rejoin-in-place trivial.
@@ -219,7 +236,7 @@ The entire match is modelled as a pure function `(matchState, event) => matchSta
 
 ## Further Notes
 
-- The design deliberately diverges from classic *Guess Who?* in that secrets are **blindly drawn** from the shared board rather than deliberately chosen, and eliminations are **manual and independent** of the questions asked. Both were explicit decisions.
+- Secrets were originally **blindly drawn** from the shared board — face-down, turn-ordered, and forced distinct — to stop either player cherry-picking an unfairly obscure Pokémon. That was reversed: players now **choose openly and simultaneously**, as in classic *Guess Who?*. The "hard card" meta is accepted as part of the game. Eliminations remain **manual and independent** of the questions asked.
 - Because each board is 24 random Pokémon (rather than a balanced set), question difficulty will swing — a type question might eliminate many cards or none. This is accepted as a characteristic of the game, not a bug.
 - The reducer being the single source of truth for game logic is the central architectural bet: it keeps the game testable without a network, and lets Supabase/React Native remain thin adapters. Realtime, persistence, and notifications all sit around it, not inside it.
 - Clerk-as-auth-provider means all RLS (including Realtime channel authorization) keys off the Clerk `sub` claim rather than Supabase's native `auth.uid()` — a small but pervasive detail to get right early.

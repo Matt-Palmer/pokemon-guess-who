@@ -11,6 +11,7 @@ const stalledAtMs = Date.parse(stalledAt);
 function match(overrides: Partial<SummarizableMatch> = {}): SummarizableMatch & { last_activity_at: string } {
   return {
     status: 'active',
+    mode: 'party',
     player1_id: P1,
     player2_id: P2,
     player1_drawn: true,
@@ -45,7 +46,15 @@ describe('claimState', () => {
     expect(claimState(m, P2, stalledAtMs + CLAIM_WINDOW_MS)).toEqual({ kind: 'not_applicable' });
   });
 
-  test('applies during the blind draw against a never-drawing opponent', () => {
+  test('a local match in play is never claimable — there is no turn to stall', () => {
+    // Same-room games have no turn loop after the pick, so "my opponent put
+    // their phone down" is a conversation, not a forfeit.
+    const state = match({ mode: 'local', current_player: null, phase: null });
+    expect(claimState(state, P1, stalledAtMs + CLAIM_WINDOW_MS + 1)).toEqual({ kind: 'not_applicable' });
+    expect(claimState(state, P2, stalledAtMs + CLAIM_WINDOW_MS + 1)).toEqual({ kind: 'not_applicable' });
+  });
+
+  test('applies during the secret pick against an opponent who never picks', () => {
     const m = match({ player2_drawn: false, current_player: null, phase: null });
     expect(claimState(m, P1, stalledAtMs + 1000)).toMatchObject({ kind: 'countdown' });
     expect(claimState(m, P1, stalledAtMs + CLAIM_WINDOW_MS)).toEqual({ kind: 'claimable' });

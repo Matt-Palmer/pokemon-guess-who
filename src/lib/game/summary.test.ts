@@ -6,6 +6,7 @@ const P2 = 'user_p2';
 function match(overrides: Partial<SummarizableMatch> = {}): SummarizableMatch {
   return {
     status: 'active',
+    mode: 'party',
     player1_id: P1,
     player2_id: P2,
     player1_drawn: true,
@@ -34,18 +35,43 @@ describe('summarizeTurn', () => {
     });
   });
 
-  describe('blind draw', () => {
+  describe('secret pick', () => {
     const noneDrawn = match({ player1_drawn: false, player2_drawn: false, current_player: null, phase: null });
     const p1Drawn = match({ player1_drawn: true, player2_drawn: false, current_player: null, phase: null });
+    const p2Drawn = match({ player1_drawn: false, player2_drawn: true, current_player: null, phase: null });
 
-    it('player 1 draws first', () => {
+    it('both players owe a pick at the start — neither waits on the other', () => {
       expect(summarizeTurn(noneDrawn, P1)).toEqual({ myMove: true, kind: 'your_draw' });
-      expect(summarizeTurn(noneDrawn, P2)).toEqual({ myMove: false, kind: 'their_draw' });
+      expect(summarizeTurn(noneDrawn, P2)).toEqual({ myMove: true, kind: 'your_draw' });
     });
 
-    it('player 2 draws once player 1 has drawn', () => {
-      expect(summarizeTurn(p1Drawn, P2)).toEqual({ myMove: true, kind: 'your_draw' });
+    it('once you have picked you wait, whichever slot you are', () => {
       expect(summarizeTurn(p1Drawn, P1)).toEqual({ myMove: false, kind: 'their_draw' });
+      expect(summarizeTurn(p1Drawn, P2)).toEqual({ myMove: true, kind: 'your_draw' });
+      expect(summarizeTurn(p2Drawn, P2)).toEqual({ myMove: false, kind: 'their_draw' });
+      expect(summarizeTurn(p2Drawn, P1)).toEqual({ myMove: true, kind: 'your_draw' });
+    });
+  });
+
+  describe('local play', () => {
+    it('has no turns once both players have picked', () => {
+      // The game is happening in the room; the app only holds the boards, so
+      // neither player is ever told it is their move.
+      const m = match({ mode: 'local', current_player: null, phase: null });
+      expect(summarizeTurn(m, P1)).toEqual({ myMove: false, kind: 'local_play' });
+      expect(summarizeTurn(m, P2)).toEqual({ myMove: false, kind: 'local_play' });
+    });
+
+    it('still runs the secret pick like any other mode', () => {
+      const m = match({
+        mode: 'local',
+        player1_drawn: false,
+        player2_drawn: true,
+        current_player: null,
+        phase: null,
+      });
+      expect(summarizeTurn(m, P1)).toEqual({ myMove: true, kind: 'your_draw' });
+      expect(summarizeTurn(m, P2)).toEqual({ myMove: false, kind: 'their_draw' });
     });
   });
 

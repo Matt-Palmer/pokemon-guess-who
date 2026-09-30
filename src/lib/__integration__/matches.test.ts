@@ -167,7 +167,7 @@ function clientFor(jwt: string) {
   });
 });
 
-(hasLiveConfig ? describe : describe.skip)('blind draw (draw_secret / my_secret)', () => {
+(hasLiveConfig ? describe : describe.skip)('secret pick (draw_secret / my_secret)', () => {
   let host: SupabaseClient;
   let joiner: SupabaseClient;
 
@@ -190,7 +190,7 @@ function clientFor(jwt: string) {
     return started;
   }
 
-  test('both players draw distinct secrets and the match opens into active play', async () => {
+  test('both players pick and the match opens into active play', async () => {
     const match = await startedMatch();
     const [first, second] = match.board;
 
@@ -199,14 +199,13 @@ function clientFor(jwt: string) {
     const { error: e2 } = await joiner.rpc('draw_secret', { p_match_id: match.id, p_pokemon_id: second });
     expect(e2).toBeNull();
 
-    // Each player reads only their own secret, and the two are distinct.
+    // Each player reads only their own secret.
     const { data: p1Secret } = await host.rpc('my_secret', { p_match_id: match.id });
     const { data: p2Secret } = await joiner.rpc('my_secret', { p_match_id: match.id });
     expect(p1Secret).toBe(first);
     expect(p2Secret).toBe(second);
-    expect(p1Secret).not.toBe(p2Secret);
 
-    // Second draw flips the match into active play with a coin-flip first turn.
+    // The second pick flips the match into active play with a coin-flip first turn.
     const { data: row } = await host
       .from('matches')
       .select('player1_drawn, player2_drawn, phase, current_player')
@@ -218,26 +217,70 @@ function clientFor(jwt: string) {
     expect(['player1', 'player2']).toContain(row?.current_player);
   });
 
-  test('player 2 cannot draw before player 1 (turn order)', async () => {
+  test('either player may pick first — player 2 does not wait on player 1', async () => {
     const match = await startedMatch();
-    const { error } = await joiner.rpc('draw_secret', {
+
+    // Player 2 goes first: no turn order to violate.
+    const { error: e2 } = await joiner.rpc('draw_secret', {
+      p_match_id: match.id,
+      p_pokemon_id: match.board[1],
+    });
+    expect(e2).toBeNull();
+
+    // The match stays in the pick phase until player 1 follows.
+    const { data: mid } = await host
+      .from('matches')
+      .select('player1_drawn, player2_drawn, phase')
+      .eq('id', match.id)
+      .single();
+    expect(mid?.player1_drawn).toBe(false);
+    expect(mid?.player2_drawn).toBe(true);
+    expect(mid?.phase).toBeNull();
+
+    const { error: e1 } = await host.rpc('draw_secret', {
       p_match_id: match.id,
       p_pokemon_id: match.board[0],
     });
-    expect(error?.message).toContain('awaiting_player1');
+    expect(e1).toBeNull();
   });
 
-  test("player 2 cannot draw player 1's card — secrets stay distinct", async () => {
+  test('both players may pick the same card', async () => {
+    const match = await startedMatch();
+    const shared = match.board[0];
+
+    await host.rpc('draw_secret', { p_match_id: match.id, p_pokemon_id: shared });
+    const { error } = await joiner.rpc('draw_secret', { p_match_id: match.id, p_pokemon_id: shared });
+    expect(error).toBeNull();
+
+    const { data: p1Secret } = await host.rpc('my_secret', { p_match_id: match.id });
+    const { data: p2Secret } = await joiner.rpc('my_secret', { p_match_id: match.id });
+    expect(p1Secret).toBe(shared);
+    expect(p2Secret).toBe(shared);
+  });
+
+  test('a pick is final — a player cannot pick twice', async () => {
     const match = await startedMatch();
     await host.rpc('draw_secret', { p_match_id: match.id, p_pokemon_id: match.board[0] });
-    const { error } = await joiner.rpc('draw_secret', {
+    const { error } = await host.rpc('draw_secret', {
       p_match_id: match.id,
-      p_pokemon_id: match.board[0],
+      p_pokemon_id: match.board[1],
     });
-    expect(error?.message).toContain('card_taken');
+    expect(error?.message).toContain('already_drawn');
   });
 
-  test('a card off the board cannot be drawn', async () => {
+  test('the board keeps its order across the pick — nothing is reshuffled', async () => {
+    // The 00014 reshuffle existed only to hide which tile a rejected
+    // `card_taken` tap had landed on. With no rejection there is nothing to
+    // hide, and a stable board lets players keep their bearings.
+    const match = await startedMatch();
+    await host.rpc('draw_secret', { p_match_id: match.id, p_pokemon_id: match.board[0] });
+    await joiner.rpc('draw_secret', { p_match_id: match.id, p_pokemon_id: match.board[1] });
+
+    const { data: row } = await host.from('matches').select('board').eq('id', match.id).single();
+    expect(row?.board).toEqual(match.board);
+  });
+
+  test('a card off the board cannot be picked', async () => {
     const match = await startedMatch();
     const { error } = await host.rpc('draw_secret', { p_match_id: match.id, p_pokemon_id: 999999 });
     expect(error?.message).toContain('not_on_board');
@@ -251,7 +294,7 @@ function clientFor(jwt: string) {
     const { error } = await joiner.from('matches').select('player1_secret').eq('id', match.id).single();
     expect(error).not.toBeNull();
 
-    // my_secret only ever returns the caller's own secret — null before they draw.
+    // my_secret only ever returns the caller's own secret — null before they pick.
     const { data: joinerSees } = await joiner.rpc('my_secret', { p_match_id: match.id });
     expect(joinerSees).toBeNull();
   });
@@ -410,6 +453,245 @@ function clientFor(jwt: string) {
     });
     expect(error).toBeNull();
   });
+});
+
+(hasLiveConfig ? describe : describe.skip)('local mode (create_party / reveal_my_secret)', () => {
+  let host: SupabaseClient;
+  let joiner: SupabaseClient;
+
+  beforeAll(async () => {
+    const [jwtA, jwtB] = await Promise.all([
+      mintSessionToken(CLERK_TEST_USER_1!),
+      mintSessionToken(CLERK_TEST_USER_2!),
+    ]);
+    host = clientFor(jwtA);
+    joiner = clientFor(jwtB);
+    await host.from('profiles').upsert({ clerk_id: CLERK_TEST_USER_1, username: 'rlstest1' });
+    await joiner.from('profiles').upsert({ clerk_id: CLERK_TEST_USER_2, username: 'rlstest2' });
+  });
+
+  /** A local match with both secrets picked — i.e. in play. */
+  async function localMatch() {
+    const { data: party } = await host.rpc('create_party', { p_mode: 'local' });
+    await joiner.rpc('join_party', { p_code: party.party_code });
+    const { data: started } = await host.rpc('start_match', { p_match_id: party.id });
+    await host.rpc('draw_secret', { p_match_id: started.id, p_pokemon_id: started.board[0] });
+    await joiner.rpc('draw_secret', { p_match_id: started.id, p_pokemon_id: started.board[1] });
+    return started;
+  }
+
+  test('a local party is created in local mode and the joiner inherits it', async () => {
+    const { data: party, error } = await host.rpc('create_party', { p_mode: 'local' });
+    expect(error).toBeNull();
+    expect(party.mode).toBe('local');
+
+    const { data: joined } = await joiner.rpc('join_party', { p_code: party.party_code });
+    expect(joined.mode).toBe('local');
+  });
+
+  test('create_party still defaults to an online party', async () => {
+    const { data } = await host.rpc('create_party');
+    expect(data.mode).toBe('party');
+  });
+
+  test('a local match opens into play with no turn state', async () => {
+    const match = await localMatch();
+    const { data: row } = await host
+      .from('matches')
+      .select('status, phase, current_player, first_player, player1_drawn, player2_drawn')
+      .eq('id', match.id)
+      .single();
+
+    expect(row?.status).toBe('active');
+    expect(row?.player1_drawn).toBe(true);
+    expect(row?.player2_drawn).toBe(true);
+    // No turns to track, so no coin flip and no phase.
+    expect(row?.phase).toBeNull();
+    expect(row?.current_player).toBeNull();
+    expect(row?.first_player).toBeNull();
+  });
+
+  test('revealing your own secret ends the match with no winner', async () => {
+    const match = await localMatch();
+
+    const { error } = await joiner.rpc('reveal_my_secret', { p_match_id: match.id });
+    expect(error).toBeNull();
+
+    const { data: row } = await host
+      .from('matches')
+      .select('status, winner_id, ended_reason, ended_at')
+      .eq('id', match.id)
+      .single();
+    expect(row?.status).toBe('completed');
+    expect(row?.winner_id).toBeNull();
+    expect(row?.ended_reason).toBe('revealed');
+    expect(row?.ended_at).not.toBeNull();
+
+    // Both players can now read both secrets through the existing RPC.
+    const { data: seen } = await host.rpc('match_result', { p_match_id: match.id });
+    expect(seen?.[0]?.player1_secret).toBe(match.board[0]);
+    expect(seen?.[0]?.player2_secret).toBe(match.board[1]);
+  });
+
+  test('a winnerless local match leaves both players’ stats untouched', async () => {
+    const before = await Promise.all([
+      host.from('profiles').select('games_played, wins, losses').eq('clerk_id', CLERK_TEST_USER_1).single(),
+      joiner.from('profiles').select('games_played, wins, losses').eq('clerk_id', CLERK_TEST_USER_2).single(),
+    ]);
+
+    const match = await localMatch();
+    await host.rpc('reveal_my_secret', { p_match_id: match.id });
+
+    const after = await Promise.all([
+      host.from('profiles').select('games_played, wins, losses').eq('clerk_id', CLERK_TEST_USER_1).single(),
+      joiner.from('profiles').select('games_played, wins, losses').eq('clerk_id', CLERK_TEST_USER_2).single(),
+    ]);
+
+    expect(after[0].data).toEqual(before[0].data);
+    expect(after[1].data).toEqual(before[1].data);
+  });
+
+  test('reveal_my_secret is rejected on an online match', async () => {
+    const { data: party } = await host.rpc('create_party');
+    await joiner.rpc('join_party', { p_code: party.party_code });
+    const { data: started } = await host.rpc('start_match', { p_match_id: party.id });
+    await host.rpc('draw_secret', { p_match_id: started.id, p_pokemon_id: started.board[0] });
+    await joiner.rpc('draw_secret', { p_match_id: started.id, p_pokemon_id: started.board[1] });
+
+    const { error } = await host.rpc('reveal_my_secret', { p_match_id: started.id });
+    expect(error?.message).toContain('not_a_local_match');
+  });
+
+  test('you cannot reveal before you have picked', async () => {
+    const { data: party } = await host.rpc('create_party', { p_mode: 'local' });
+    await joiner.rpc('join_party', { p_code: party.party_code });
+    const { data: started } = await host.rpc('start_match', { p_match_id: party.id });
+
+    const { error } = await host.rpc('reveal_my_secret', { p_match_id: started.id });
+    expect(error?.message).toContain('no_secret_yet');
+  });
+
+  test('a local match in play cannot be claimed for inactivity', async () => {
+    // No turns means no stalled mover to accuse. (The 7-day window is not
+    // reachable here, but the mode check fires before it.)
+    const match = await localMatch();
+    const { error } = await host.rpc('claim_inactive_win', { p_match_id: match.id });
+    expect(error?.message).toContain('not_claimable');
+  });
+});
+
+(hasLiveConfig ? describe : describe.skip)('board mark realtime isolation', () => {
+  let host: SupabaseClient;
+  let joiner: SupabaseClient;
+  let joinerJwt: string;
+
+  beforeAll(async () => {
+    const [jwtA, jwtB] = await Promise.all([
+      mintSessionToken(CLERK_TEST_USER_1!),
+      mintSessionToken(CLERK_TEST_USER_2!),
+    ]);
+    host = clientFor(jwtA);
+    joiner = clientFor(jwtB);
+    joinerJwt = jwtB;
+    await host.from('profiles').upsert({ clerk_id: CLERK_TEST_USER_1, username: 'rlstest1' });
+    await joiner.from('profiles').upsert({ clerk_id: CLERK_TEST_USER_2, username: 'rlstest2' });
+  });
+
+  async function playingMatch() {
+    const { data: party } = await host.rpc('create_party');
+    await joiner.rpc('join_party', { p_code: party.party_code });
+    const { data: started } = await host.rpc('start_match', { p_match_id: party.id });
+    await host.rpc('draw_secret', { p_match_id: started.id, p_pokemon_id: started.board[0] });
+    await joiner.rpc('draw_secret', { p_match_id: started.id, p_pokemon_id: started.board[1] });
+    return started;
+  }
+
+  type MarkEvent = { eventType: string; owner_id?: string; pokemon_id?: number };
+
+  /**
+   * Subscribe as the joiner and collect `board_marks` events on `filter`.
+   * Mirrors the client hook: the token goes onto the socket *before* the join,
+   * or the channel joins as `anon` and RLS-gated changes never arrive.
+   */
+  async function collect(filter: string, matchId: string, during: () => Promise<void>) {
+    const events: MarkEvent[] = [];
+    await joiner.realtime.setAuth(joinerJwt);
+
+    const channel = joiner.channel(`test:board_marks:${matchId}:${filter}`).on(
+      'postgres_changes',
+      { event: '*', schema: 'public', table: 'board_marks', filter },
+      (payload) => {
+        const rec = (payload.eventType === 'DELETE' ? payload.old : payload.new) as MarkEvent;
+        events.push({ eventType: payload.eventType, owner_id: rec?.owner_id, pokemon_id: rec?.pokemon_id });
+      },
+    );
+
+    await new Promise<void>((resolve, reject) => {
+      channel.subscribe((status) => {
+        if (status === 'SUBSCRIBED') resolve();
+        if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') reject(new Error(status));
+      });
+    });
+
+    await during();
+    // Realtime is push-based with no completion signal; give the broadcast a
+    // window to arrive before asserting on its absence.
+    await new Promise((r) => setTimeout(r, 2500));
+    await joiner.removeChannel(channel);
+    return events;
+  }
+
+  test("the opponent's cross-offs never reach an owner-scoped subscription", async () => {
+    const match = await playingMatch();
+    const target = match.board[6];
+
+    const events = await collect(`owner_id=eq.${CLERK_TEST_USER_2}`, match.id, async () => {
+      // The host crosses a card off and then un-crosses it. Neither is the
+      // joiner's row, so neither may touch the joiner's board.
+      await host.rpc('set_board_mark', { p_match_id: match.id, p_pokemon_id: target, p_eliminated: true });
+      await new Promise((r) => setTimeout(r, 800));
+      await host.rpc('set_board_mark', { p_match_id: match.id, p_pokemon_id: target, p_eliminated: false });
+    });
+
+    expect(events.filter((e) => e.owner_id !== CLERK_TEST_USER_2)).toEqual([]);
+    expect(events).toEqual([]);
+  }, 30_000);
+
+  test("an owner-scoped subscription still receives the owner's own marks", async () => {
+    const match = await playingMatch();
+    const target = match.board[7];
+
+    const events = await collect(`owner_id=eq.${CLERK_TEST_USER_2}`, match.id, async () => {
+      await joiner.rpc('set_board_mark', { p_match_id: match.id, p_pokemon_id: target, p_eliminated: true });
+      await new Promise((r) => setTimeout(r, 800));
+      await joiner.rpc('set_board_mark', { p_match_id: match.id, p_pokemon_id: target, p_eliminated: false });
+    });
+
+    expect(events.map((e) => e.eventType)).toEqual(['INSERT', 'DELETE']);
+    expect(events.every((e) => e.owner_id === CLERK_TEST_USER_2)).toBe(true);
+    expect(events.every((e) => e.pokemon_id === target)).toBe(true);
+  }, 30_000);
+
+  test('a match-scoped subscription leaks the opponent — the bug this hook guards against', async () => {
+    // The original subscription filtered on `match_id` alone and trusted RLS to
+    // scope the stream. Realtime applies RLS to INSERT and UPDATE but not to
+    // DELETE, so the opponent's un-crossings arrived and the handler removed the
+    // matching id from *this* player's marks — a tile flipping face-up on its
+    // own. Pinned here so the reason the filter is owner-scoped stays visible,
+    // and so we find out if Realtime's behaviour ever changes.
+    const match = await playingMatch();
+    const target = match.board[8];
+
+    const events = await collect(`match_id=eq.${match.id}`, match.id, async () => {
+      await host.rpc('set_board_mark', { p_match_id: match.id, p_pokemon_id: target, p_eliminated: true });
+      await new Promise((r) => setTimeout(r, 800));
+      await host.rpc('set_board_mark', { p_match_id: match.id, p_pokemon_id: target, p_eliminated: false });
+    });
+
+    const leaked = events.filter((e) => e.owner_id !== CLERK_TEST_USER_2);
+    console.log('match-scoped filter leaked:', JSON.stringify(leaked));
+    expect(events.some((e) => e.eventType === 'INSERT' && e.owner_id !== CLERK_TEST_USER_2)).toBe(false);
+  }, 30_000);
 });
 
 (hasLiveConfig ? describe : describe.skip)('guessing & win/loss (guess / match_result)', () => {
@@ -904,7 +1186,7 @@ function clientFor(jwt: string) {
     expect(row?.winner_id).toBe(CLERK_TEST_USER_1);
   });
 
-  test('a match can be resigned during the blind draw', async () => {
+  test('a match can be resigned during the secret pick', async () => {
     const match = await startedMatch(false);
     const { error } = await host.rpc('resign', { p_match_id: match.id });
     expect(error).toBeNull();

@@ -17,7 +17,7 @@
 
 export type RevealableMatch = {
   status: 'lobby' | 'active' | 'completed' | 'abandoned';
-  ended_reason: 'guess' | 'resign' | 'claim_inactive' | null;
+  ended_reason: 'guess' | 'resign' | 'claim_inactive' | 'revealed' | null;
   winner_id: string | null;
   player1_id: string;
 };

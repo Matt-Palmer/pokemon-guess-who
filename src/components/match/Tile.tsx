@@ -1,4 +1,3 @@
-import { Image } from 'expo-image';
 import { useCallback, useEffect, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import Animated, {
@@ -13,6 +12,7 @@ import Animated, {
   ZoomIn,
 } from 'react-native-reanimated';
 
+import { PokemonImage } from '@/components/match/PokemonImage';
 import { typeColors } from '@/constants/colors';
 import { regionForGeneration } from '@/constants/regions';
 import { PokemonCard } from '@/lib/matches';
@@ -25,16 +25,14 @@ export type TileView = 'pokemon' | 'type' | 'region';
 
 type Props = {
   card: PokemonCard;
-  /** Face-down = crossed off in play, undrawn in the blind draw. */
+  /** Face-down = crossed off. The board is face-up from the secret pick on. */
   faceDown: boolean;
   /** Board position, for the deal-in and view-change staggers. */
   dealIndex: number;
   /** Which facet the face shows (Pokémon sprite / type / region). */
   view?: TileView;
-  /** Your own secret: accent border face-up... */
+  /** Your own secret: accent border on the face. */
   mine?: boolean;
-  /** ...or a ★ on the back while the board is face-down in the draw. */
-  backMark?: string;
   /** Guess-mode target highlight. */
   targeted?: boolean;
   disabled?: boolean;
@@ -101,7 +99,7 @@ function TileFace({
 
       <View style={styles.hero}>
         {shown === 'pokemon' && (
-          <Image source={{ uri: card.sprite_url }} style={styles.sprite} contentFit="contain" />
+          <PokemonImage uri={card.sprite_url} style={styles.sprite} />
         )}
         {shown === 'type' && (
           <View style={styles.typeStack}>
@@ -143,7 +141,6 @@ export function Tile({
   dealIndex,
   view = 'pokemon',
   mine,
-  backMark,
   targeted,
   disabled,
   shakeNonce,
@@ -189,12 +186,7 @@ export function Tile({
         flipped={faceDown}
         style={styles.flip}
         front={<TileFace card={card} view={view} mine={mine} targeted={targeted} dealIndex={dealIndex} />}
-        back={
-          <>
-            <CardBack />
-            {backMark ? <Text style={styles.backMark}>{backMark}</Text> : null}
-          </>
-        }
+        back={<CardBack />}
       />
     </AnimatedPressable>
   );
@@ -253,15 +245,5 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: colors.ink,
     textTransform: 'capitalize',
-  },
-  backMark: {
-    position: 'absolute',
-    alignSelf: 'center',
-    top: '30%',
-    fontSize: 22,
-    fontWeight: '800',
-    color: colors.onPrimary,
-    textShadowColor: colors.primaryPressed,
-    textShadowRadius: 4,
   },
 });

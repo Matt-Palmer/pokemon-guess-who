@@ -20,7 +20,7 @@ type Props = {
 export function PartyModal({ visible, onClose, onEnterLobby }: Props) {
   const supabase = useSupabase();
   const [code, setCode] = useState('');
-  const [busy, setBusy] = useState<null | 'create' | 'join'>(null);
+  const [busy, setBusy] = useState<null | 'party' | 'local' | 'join'>(null);
   const [error, setError] = useState<string | null>(null);
 
   const reset = () => {
@@ -35,11 +35,11 @@ export function PartyModal({ visible, onClose, onEnterLobby }: Props) {
     onClose();
   };
 
-  const onCreate = async () => {
+  const onCreate = async (mode: 'party' | 'local') => {
     setError(null);
-    setBusy('create');
+    setBusy(mode);
     try {
-      const match = await createParty(supabase);
+      const match = await createParty(supabase, mode);
       reset();
       onEnterLobby(match.id);
     } catch (err: any) {
@@ -71,7 +71,24 @@ export function PartyModal({ visible, onClose, onEnterLobby }: Props) {
     <CardModal visible={visible} onClose={close} title="Play a friend">
       <View style={styles.body}>
         <Text style={styles.help}>Create a private game and share the code with a friend.</Text>
-        <Button title="Start a party" onPress={onCreate} busy={busy === 'create'} disabled={disabled} />
+        <Button
+          title="Play online"
+          onPress={() => onCreate('party')}
+          busy={busy === 'party'}
+          disabled={disabled}
+        />
+        {/* Same code, same lobby — only the mode differs, so whoever joins
+            inherits it and never has to choose. */}
+        <Button
+          title="Play in the same room"
+          variant="secondary"
+          onPress={() => onCreate('local')}
+          busy={busy === 'local'}
+          disabled={disabled}
+        />
+        <Text style={styles.modeHint}>
+          Same room: ask your questions out loud — the app just keeps the board.
+        </Text>
 
         <View style={styles.dividerRow}>
           <View style={styles.divider} />
@@ -106,6 +123,7 @@ export function PartyModal({ visible, onClose, onEnterLobby }: Props) {
 const styles = StyleSheet.create({
   body: { gap: spacing.md },
   help: { ...type.body, color: colors.inkMuted },
+  modeHint: { ...type.caption, marginTop: -spacing.xs },
   dividerRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
   divider: { flex: 1, height: 1.5, backgroundColor: colors.border },
   dividerText: { ...type.caption, fontWeight: '700' },

@@ -3,6 +3,7 @@ export { Button } from '@/ui/Button';
 export { Card } from '@/ui/Card';
 export { CardBack } from '@/ui/CardBack';
 export { CardModal } from '@/ui/CardModal';
+export { ConfirmDialog, type Confirmation } from '@/ui/ConfirmDialog';
 export { Confetti } from '@/ui/Confetti';
 export { FlipCard } from '@/ui/FlipCard';
 export { dealDelay, motion } from '@/ui/motion';

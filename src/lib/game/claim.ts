@@ -25,10 +25,16 @@ export function claimState(
   nowMs: number,
 ): ClaimState {
   if (match.status !== 'active') return { kind: 'not_applicable' };
-  // summarizeTurn is draw-order aware and knows the answerer holds the move
+  const turn = summarizeTurn(match, myId);
+  // summarizeTurn knows who owes a pick, and that the answerer holds the move
   // during awaiting_answer — when the move is mine, *I* am the potential
   // staller and no claim exists for me.
-  if (summarizeTurn(match, myId).myMove) return { kind: 'not_applicable' };
+  if (turn.myMove) return { kind: 'not_applicable' };
+  // Local play has no turn loop, so nobody is stalling: the game is happening
+  // in the room and the app is only holding the board. (Mirrored server-side in
+  // `claim_inactive_win`.) The pick phase still claims normally — someone can
+  // leave you hanging before play starts.
+  if (turn.kind === 'local_play') return { kind: 'not_applicable' };
 
   const remainingMs = Date.parse(match.last_activity_at) + CLAIM_WINDOW_MS - nowMs;
   return remainingMs > 0 ? { kind: 'countdown', remainingMs } : { kind: 'claimable' };

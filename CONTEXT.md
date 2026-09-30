@@ -1,6 +1,6 @@
 # Pokémon Guess Who
 
-A two-player async mobile game of Guess Who? played with Pokémon: each player blindly draws a secret from a shared 24-card board, then alternates yes/no questions to deduce the opponent's secret.
+A two-player async mobile game of Guess Who? played with Pokémon: each player picks a secret from a shared 24-card board, then alternates yes/no questions to deduce the opponent's secret.
 
 ## Language
 
@@ -26,12 +26,12 @@ _Avoid_: Hidden card, target
 Flipping one of your own tiles face-down to eliminate it as a candidate. Private to you, reversible, independent of any question.
 _Avoid_: Mark, eliminate, strike
 
-**Blind draw**:
-The turn-ordered opening phase where each player draws their secret unseen from the board.
-_Avoid_: Setup, deal
+**Secret pick**:
+The opening phase where each player chooses their secret from the face-up board. Simultaneous — neither player waits on the other — and the two may land on the same Pokémon.
+_Avoid_: Blind draw (the superseded turn-ordered, face-down version), setup, deal
 
 **Phase**:
-Where a match is in its arc: lobby → blind draw → questioning → finished. A player should always know the current phase at a glance.
+Where a match is in its arc: lobby → secret pick → questioning → finished. A player should always know the current phase at a glance.
 _Avoid_: Stage, state (overloaded with reducer state)
 
 **Your move**:
@@ -50,6 +50,14 @@ _Avoid_: Final answer
 A private match a host creates for a friend to join by code.
 _Avoid_: Lobby (that's the phase), room
 
+**Local game**:
+A match between two people in the same room, on two phones. Same board, same secret pick, same private cross-offs — but no turns, no thread and no in-app guessing, because the questions are asked out loud. Ends when a player reveals their own secret.
+_Avoid_: Same-room mode (fine in UI copy, but `local` is the mode value), pass-and-play (that's one device, which this is not)
+
+**Reveal**:
+Turning your own secret face-up for your opponent, which ends a local game. Only ever your own card — a button that showed your opponent's would just be a peek.
+_Avoid_: Show, concede
+
 ### UI
 
 **Chat bubble**:
@@ -65,5 +73,6 @@ _Avoid_: Turn banner (the old bottom-third panel)
 **Guess reveal**:
 The animated turn-over of the opponent's secret when a guess resolves — the match's emotional payoff.
 
-**Draw ceremony**:
-The animated ritual presentation of the blind draw.
+**Pick ceremony**:
+The beat after you lock your secret in: the board falls away, your card takes the centre of the screen, and it doubles as the waiting state until play opens.
+_Avoid_: Draw ceremony

@@ -104,7 +104,7 @@ function distinctMatches(results: (string | null)[]): string[] {
 
       expect(error).toBeNull();
       expect(match!.mode).toBe('random');
-      expect(match!.status).toBe('active'); // no lobby — straight to the blind draw
+      expect(match!.status).toBe('active'); // no lobby — straight to the secret pick
       expect(match!.party_code).toBeNull();
       expect(match!.player1_id).toBe(CLERK_TEST_USER_1); // longest-waiting draws first
       expect(match!.player2_id).toBe(CLERK_TEST_USER_2);
@@ -197,7 +197,7 @@ function distinctMatches(results: (string | null)[]): string[] {
   );
 
   test(
-    'a matched game plays the standard blind draw into active play',
+    'a matched game plays the standard secret pick into active play',
     async () => {
       await waiter.rpc('find_random_game');
       const { data: matchId } = await joiner.rpc('find_random_game');

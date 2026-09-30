@@ -19,9 +19,9 @@ function turnCopy(kind: TurnKind, opponent: string): string {
     case 'waiting_for_host':
       return `Waiting for ${opponent} to start`;
     case 'your_draw':
-      return 'Draw your secret';
+      return 'Choose your secret';
     case 'their_draw':
-      return `Waiting for ${opponent} to draw`;
+      return `Waiting for ${opponent} to choose`;
     case 'your_question':
       return 'Ask or guess';
     case 'their_question':
@@ -30,16 +30,18 @@ function turnCopy(kind: TurnKind, opponent: string): string {
       return 'Answer their question';
     case 'their_answer':
       return `Waiting for ${opponent} to answer`;
+    case 'local_play':
+      return 'Playing in the room';
     case 'finished':
       return 'Finished';
   }
 }
 
-/** A short phase chip label, derived from the match row (blind draw vs play). */
+/** A short phase chip label, derived from the match row (secret pick vs play). */
 function phaseLabel(match: MyMatchRow): string {
   if (match.status === 'lobby') return 'Lobby';
-  if (!match.player1_drawn || !match.player2_drawn) return 'Blind draw';
-  return 'Playing';
+  if (!match.player1_drawn || !match.player2_drawn) return 'Choosing';
+  return match.mode === 'local' ? 'Same room' : 'Playing';
 }
 
 /** A round game-piece avatar: opponent emoji/initial, or a waiting glyph for an open party. */

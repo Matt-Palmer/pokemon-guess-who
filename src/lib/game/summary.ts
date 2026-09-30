@@ -17,12 +17,14 @@ export type TurnKind =
   | 'their_question'
   | 'your_answer'
   | 'their_answer'
+  | 'local_play' // same-room: both picked, no turns — play happens out loud
   | 'finished';
 
 export type TurnSummary = { myMove: boolean; kind: TurnKind };
 
 export type SummarizableMatch = {
   status: 'lobby' | 'active' | 'completed' | 'abandoned';
+  mode: 'party' | 'random' | 'local';
   player1_id: string;
   player2_id: string | null;
   player1_drawn: boolean;
@@ -45,13 +47,19 @@ export function summarizeTurn(match: SummarizableMatch, myId: string): TurnSumma
       : { myMove: false, kind: 'waiting_for_opponent' };
   }
 
-  // Active. Blind draw first: player 1 draws, then player 2.
+  // Active. Secret pick first: both players choose at once from the face-up
+  // board, so the only question is whether *you* still owe a pick — never
+  // whose turn it is to pick.
   if (!match.player1_drawn || !match.player2_drawn) {
-    const drawSlot = match.player1_drawn ? 'player2' : 'player1';
-    return drawSlot === mySlot
-      ? { myMove: true, kind: 'your_draw' }
-      : { myMove: false, kind: 'their_draw' };
+    const iHavePicked = mySlot === 'player1' ? match.player1_drawn : match.player2_drawn;
+    return iHavePicked
+      ? { myMove: false, kind: 'their_draw' }
+      : { myMove: true, kind: 'your_draw' };
   }
+
+  // Local play has no turn loop to summarize: once both players have picked,
+  // the game is happening in the room and the app is only keeping the board.
+  if (match.mode === 'local') return { myMove: false, kind: 'local_play' };
 
   // Turn loop. The answerer is the opponent of the asker (current_player).
   if (match.phase === 'awaiting_answer') {

@@ -8,10 +8,13 @@ function other(player: PlayerSlot): PlayerSlot {
 }
 
 /**
- * The slot that must act next in an active match: draw order first (player 1,
- * then player 2), the answerer during `awaiting_answer`, otherwise the current
- * player. This is who a CLAIM_INACTIVE accuses of stalling — the claim is only
- * valid when the *opponent* of the claimer is the one to move.
+ * The slot that must act next in an active match: a player who has yet to pick a
+ * secret, the answerer during `awaiting_answer`, otherwise the current player.
+ *
+ * During the secret pick both players can owe a move at once, so this reports
+ * only the first of them and is too coarse to gate an inactivity claim on by
+ * itself — {@link claimInactive} asks about the opponent specifically. In the
+ * turn loop exactly one player ever owes a move, so it stays exact there.
  */
 export function playerToMove(state: MatchState): PlayerSlot {
   if (state.player1Secret === null) return 'player1';
@@ -21,12 +24,15 @@ export function playerToMove(state: MatchState): PlayerSlot {
 }
 
 /**
- * Blind draw: a player secretly draws one card from the shared board. Player 1
- * draws first; player 2 then draws from the remaining pool, so the two secrets
- * are always distinct. The drawn card leaves the *draw pool* (it can't be drawn
- * again) but stays on the board for guessing. Randomness — board generation and
- * the first-turn coin flip — lives in the DB adapter, not this pure reducer, so
- * the rules here stay deterministic and exhaustively testable.
+ * Secret pick: each player chooses one card from the face-up shared board as
+ * their secret. Picks are simultaneous and independent — neither player waits on
+ * the other — and both may land on the same Pokémon. Duplicates are harmless:
+ * {@link guess} always compares against the *opponent's* stored secret, so
+ * holding the same card as your opponent neither helps nor hinders either of
+ * you. A pick is final once made; the client confirms a selection before
+ * committing it. Randomness — board generation and the first-turn coin flip —
+ * lives in the DB adapter, not this pure reducer, so the rules here stay
+ * deterministic and exhaustively testable.
  */
 function drawSecret(state: MatchState, player: PlayerSlot, pokemonId: number): MatchState {
   if (state.status !== 'active') {
@@ -39,15 +45,6 @@ function drawSecret(state: MatchState, player: PlayerSlot, pokemonId: number): M
   const ownSecret = player === 'player1' ? state.player1Secret : state.player2Secret;
   if (ownSecret !== null) {
     throw new Error('You have already drawn your secret');
-  }
-
-  if (player === 'player2') {
-    if (state.player1Secret === null) {
-      throw new Error('Waiting for player 1 to draw first');
-    }
-    if (pokemonId === state.player1Secret) {
-      throw new Error('That card has already been drawn');
-    }
   }
 
   return {
@@ -225,17 +222,26 @@ function resign(state: MatchState, player: PlayerSlot): MatchState {
 }
 
 /**
- * Claim the win from an inactive opponent. Valid only when it is the
- * *opponent's* move ({@link playerToMove} — draw-phase aware, and during
- * `awaiting_answer` the answerer, not the asker, is the one stalling) and
- * nothing has happened for {@link CLAIM_WINDOW_MS} (7 days) since
- * `lastActivityAt`. The claimer wins; the no-show takes the loss.
+ * Claim the win from an inactive opponent. Valid only while the *opponent* is
+ * the one holding things up, and nothing has happened for
+ * {@link CLAIM_WINDOW_MS} (7 days) since `lastActivityAt`. The claimer wins; the
+ * no-show takes the loss.
+ *
+ * "Holding things up" is asked two ways. During the secret pick both players can
+ * owe a move simultaneously, so the only question is whether the opponent has
+ * yet to pick — your own pick is irrelevant, and waiting on each other for a
+ * week should not leave the claim available to just one of you. In the turn loop
+ * exactly one player owes a move, so {@link playerToMove} answers it (during
+ * `awaiting_answer` that is the answerer, not the asker).
  */
 function claimInactive(state: MatchState, player: PlayerSlot, nowIso: string): MatchState {
   if (state.status !== 'active') {
     throw new Error('Only an active match can be claimed');
   }
-  if (playerToMove(state) !== other(player)) {
+  const opponent = other(player);
+  const opponentSecret = opponent === 'player1' ? state.player1Secret : state.player2Secret;
+  const picking = state.player1Secret === null || state.player2Secret === null;
+  if (picking ? opponentSecret !== null : playerToMove(state) !== opponent) {
     throw new Error('You can only claim while waiting on your opponent');
   }
   if (Date.parse(nowIso) - Date.parse(state.lastActivityAt) < CLAIM_WINDOW_MS) {

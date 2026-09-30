@@ -1,9 +1,19 @@
+import { useUser } from '@clerk/clerk-expo';
 import { RealtimeChannel, SupabaseClient } from '@supabase/supabase-js';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { AppState, Platform } from 'react-native';
 
 import { useRealtimeAuth, useSupabase } from '@/lib/supabase';
 
 export type MatchStatus = 'lobby' | 'active' | 'completed' | 'abandoned';
+
+/**
+ * How a match is played. `party` and `random` are the async online game;
+ * `local` is two people in the same room on two phones — same board and same
+ * private cross-offs, but no turns, no thread and no in-app guessing, because
+ * the conversation happens out loud.
+ */
+export type MatchMode = 'party' | 'random' | 'local';
 
 /**
  * A `matches` row as clients see it. The secret columns are deliberately absent:
@@ -14,7 +24,7 @@ export type MatchStatus = 'lobby' | 'active' | 'completed' | 'abandoned';
 export type MatchRow = {
   id: string;
   status: MatchStatus;
-  mode: 'party' | 'random';
+  mode: MatchMode;
   party_code: string | null;
   player1_id: string;
   player2_id: string | null;
@@ -24,7 +34,7 @@ export type MatchRow = {
   current_player: 'player1' | 'player2' | null;
   phase: 'awaiting_question' | 'awaiting_answer' | null;
   winner_id: string | null;
-  ended_reason: 'guess' | 'resign' | 'claim_inactive' | null;
+  ended_reason: 'guess' | 'resign' | 'claim_inactive' | 'revealed' | null;
   first_player: 'player1' | 'player2' | null;
   created_at: string;
   last_activity_at: string;
@@ -69,8 +79,11 @@ export type PokemonCard = {
 };
 
 /** Host creates a private party; the returned row carries the party code. */
-export async function createParty(supabase: SupabaseClient): Promise<MatchRow> {
-  const { data, error } = await supabase.rpc('create_party');
+export async function createParty(
+  supabase: SupabaseClient,
+  mode: 'party' | 'local' = 'party',
+): Promise<MatchRow> {
+  const { data, error } = await supabase.rpc('create_party', { p_mode: mode });
   if (error) throw new Error(error.message);
   return data as MatchRow;
 }
@@ -275,13 +288,27 @@ export async function guess(
 /**
  * Resign the match: an immediate forfeit — the opponent wins, the caller takes
  * the loss. Never turn-gated; available any time the match is active (the
- * blind draw included). The status flip lands via Realtime too, but callers
+ * secret pick included). The status flip lands via Realtime too, but callers
  * should refetch the match on success so their own end screen never depends on
  * the realtime round-trip.
  */
 export async function resign(supabase: SupabaseClient, matchId: string): Promise<void> {
   const { error } = await supabase.rpc('resign', { p_match_id: matchId });
   if (error) throw friendlyTurnError(error.message, 'Could not resign this game.');
+}
+
+/**
+ * Show your own secret to your opponent, ending a local match.
+ *
+ * The only way a same-room game finishes: your opponent says the name out loud,
+ * and you turn your card over to confirm it. Deliberately restricted to *your*
+ * secret — a button that revealed the opponent's would just be a peek button,
+ * and the mode would stop being a game. Ends with no winner: the app never saw
+ * the guess, so it has nothing to record.
+ */
+export async function revealMySecret(supabase: SupabaseClient, matchId: string): Promise<void> {
+  const { error } = await supabase.rpc('reveal_my_secret', { p_match_id: matchId });
+  if (error) throw friendlyTurnError(error.message, 'Could not reveal your secret.');
 }
 
 const CLAIM_ERRORS: Record<string, string> = {
@@ -411,6 +438,8 @@ export function useMatchEvents(matchId: string | undefined, revalidateKey?: stri
 export function useBoardMarks(matchId: string | undefined) {
   const supabase = useSupabase();
   const authNow = useRealtimeAuth(supabase);
+  const { user } = useUser();
+  const myId = user?.id;
   const [marks, setMarks] = useState<Set<number>>(new Set());
   // Mirror of `marks` for reading the latest value inside `toggle` without
   // making the callback depend on (and churn with) every mark change.
@@ -452,14 +481,18 @@ export function useBoardMarks(matchId: string | undefined) {
     let cancelled = false;
     let channel: RealtimeChannel | undefined;
 
-    supabase
-      .from('board_marks')
-      .select('pokemon_id')
-      .eq('match_id', matchId)
-      .then(({ data }) => {
-        if (cancelled || !data) return;
-        setMarks(new Set((data as { pokemon_id: number }[]).map((r) => r.pokemon_id)));
-      });
+    const loadMarks = () =>
+      supabase
+        .from('board_marks')
+        .select('pokemon_id')
+        .eq('match_id', matchId)
+        .eq('owner_id', myId ?? '')
+        .then(({ data }) => {
+          if (cancelled || !data) return;
+          setMarks(new Set((data as { pokemon_id: number }[]).map((r) => r.pokemon_id)));
+        });
+
+    loadMarks();
 
     (async () => {
       await authNow();
@@ -468,16 +501,41 @@ export function useBoardMarks(matchId: string | undefined) {
         .channel(`board_marks:${matchId}`)
         .on(
           'postgres_changes',
-          { event: '*', schema: 'public', table: 'board_marks', filter: `match_id=eq.${matchId}` },
+          // Filter on the owner, not the match. Realtime applies RLS to INSERT
+          // and UPDATE but *not* to DELETE — a deleted row is broadcast to every
+          // subscriber on the filter regardless of the owner-only policy — so a
+          // match-scoped filter delivered the opponent's un-crossings to this
+          // device, which then flipped the matching tile face-up. Scoping the
+          // subscription to `owner_id` keeps their rows off this channel
+          // entirely; the handler re-checks anyway, because a leak here is
+          // silent and shows up as a board that changes by itself.
+          { event: '*', schema: 'public', table: 'board_marks', filter: `owner_id=eq.${myId}` },
           (payload) => {
             if (cancelled) return;
+            const record = (payload.eventType === 'DELETE' ? payload.old : payload.new) as {
+              match_id?: string;
+              owner_id?: string;
+              pokemon_id?: number;
+            };
+
+            // `replica identity full` means both old and new carry every column,
+            // so a row that can't be shown to belong to this player on this
+            // match is never applied. Re-reading instead of ignoring keeps the
+            // board correct even if a payload arrives partial.
+            if (record?.owner_id !== myId || record?.match_id !== matchId) {
+              if (record?.owner_id === myId) loadMarks();
+              return;
+            }
+            if (typeof record.pokemon_id !== 'number') {
+              loadMarks();
+              return;
+            }
+            const { pokemon_id: pokemonId } = record;
+
             setMarks((prev) => {
               const next = new Set(prev);
-              if (payload.eventType === 'DELETE') {
-                next.delete((payload.old as { pokemon_id: number }).pokemon_id);
-              } else {
-                next.add((payload.new as { pokemon_id: number }).pokemon_id);
-              }
+              if (payload.eventType === 'DELETE') next.delete(pokemonId);
+              else next.add(pokemonId);
               return next;
             });
           },
@@ -489,9 +547,48 @@ export function useBoardMarks(matchId: string | undefined) {
       cancelled = true;
       if (channel) supabase.removeChannel(channel);
     };
-  }, [matchId, supabase, authNow]);
+  }, [matchId, supabase, authNow, myId]);
 
   return { marks, toggle };
+}
+
+/** How often an active match re-reads itself as a backstop to Realtime. */
+const MATCH_POLL_MS = 30_000;
+
+/**
+ * Run `onForeground` whenever the app (or browser tab) becomes visible again.
+ *
+ * Browsers aggressively throttle timers in background tabs — typically to no
+ * more than once a minute. `useRealtimeAuth` re-mints the Clerk JWT every 40s
+ * precisely because the token lives only ~60s, so a backgrounded tab can miss
+ * its refresh window, the socket's authorization lapses, and RLS-gated
+ * `postgres_changes` **stop arriving silently**. The tab then looks connected
+ * while being permanently stale — the opponent's move, or a reveal, never lands.
+ *
+ * Coming back to the foreground is the moment to re-authorize and re-read.
+ */
+function useForegroundRefresh(onForeground: () => void) {
+  const handler = useRef(onForeground);
+  handler.current = onForeground;
+
+  useEffect(() => {
+    if (Platform.OS === 'web') {
+      if (typeof document === 'undefined') return;
+      const onVisible = () => {
+        if (document.visibilityState === 'visible') handler.current();
+      };
+      document.addEventListener('visibilitychange', onVisible);
+      window.addEventListener('focus', onVisible);
+      return () => {
+        document.removeEventListener('visibilitychange', onVisible);
+        window.removeEventListener('focus', onVisible);
+      };
+    }
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') handler.current();
+    });
+    return () => sub.remove();
+  }, []);
 }
 
 /**
@@ -559,6 +656,26 @@ export function useMatch(matchId: string | undefined) {
       if (channel) supabase.removeChannel(channel);
     };
   }, [matchId, supabase, authNow]);
+
+  // Belt-and-braces beneath Realtime. The match row is what decides which
+  // screen you are on, so a single dropped or unauthorized event doesn't just
+  // delay an update — it wedges the game (a revealed secret never appears, a
+  // passed turn never arrives). Re-authorize and re-read on foreground, and
+  // poll slowly while the match is live: one row every 30s is nothing next to
+  // a player staring at a screen that will never change.
+  useForegroundRefresh(
+    useCallback(() => {
+      authNow().catch(() => {});
+      refetch();
+    }, [authNow, refetch]),
+  );
+
+  const isLive = match?.status === 'active' || match?.status === 'lobby';
+  useEffect(() => {
+    if (!matchId || !isLive) return;
+    const timer = setInterval(() => refetch(), MATCH_POLL_MS);
+    return () => clearInterval(timer);
+  }, [matchId, isLive, refetch]);
 
   return { match, loading, error, refetch };
 }

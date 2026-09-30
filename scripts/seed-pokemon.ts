@@ -10,6 +10,9 @@ import { createClient } from '@supabase/supabase-js';
 const SUPABASE_URL = process.env.EXPO_PUBLIC_SUPABASE_URL!;
 const SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 
+/** Pinned PokeAPI/sprites ref — keep in step with migration 00017. */
+const SPRITES_REF = 'master';
+
 type GraphQLPokemon = {
   id: number;
   name: string;
@@ -17,8 +20,19 @@ type GraphQLPokemon = {
   pokemon_v2_pokemonspecy: { generation_id: number };
 };
 
+/**
+ * Official artwork, served through jsDelivr rather than raw.githubusercontent.
+ *
+ * Same files, same repo — but `raw.githubusercontent.com` is a source host, not
+ * an asset CDN: it rate-limits and redirects, and a board requesting 24 sprites
+ * at once is exactly the burst it throttles. That showed up in game as tiles
+ * randomly rendering blank. jsDelivr fronts the same repo with real CDN caching.
+ *
+ * The tag is pinned rather than tracking `master`, so a sprite that renders
+ * today keeps rendering and the CDN can cache it indefinitely.
+ */
 function artworkUrl(id: number): string {
-  return `https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/official-artwork/${id}.png`;
+  return `https://cdn.jsdelivr.net/gh/PokeAPI/sprites@${SPRITES_REF}/sprites/pokemon/other/official-artwork/${id}.png`;
 }
 
 async function fetchAllPokemon(): Promise<GraphQLPokemon[]> {
